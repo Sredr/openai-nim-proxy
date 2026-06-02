@@ -2,13 +2,12 @@ const express = require('express');
 const cors = require('cors');
 const axios = require('axios');
 const https = require('https');
-const crypto = require('crypto'); // Додано для генерації ключів
+const crypto = require('crypto');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
 app.use(cors());
-// 50mb для гігантських лорбуків і довгих RP чатів
 app.use(express.json({ limit: '50mb' })); 
 
 const NIM_API_BASE = 'https://integrate.api.nvidia.com/v1';
@@ -16,7 +15,6 @@ const NIM_API_BASE = 'https://integrate.api.nvidia.com/v1';
 // ─── Генеративний Адмін-Ключ ───────────────────────────────────────────────
 let ADMIN_KEY = process.env.ADMIN_KEY;
 if (!ADMIN_KEY) {
-  // Генеруємо випадковий 12-значний hex-рядок (наприклад: 8f4e2a1b9c3d)
   ADMIN_KEY = crypto.randomBytes(6).toString('hex');
   console.log('\n=============================================================');
   console.log('⚠️ Змінну ADMIN_KEY не задано в середовищі (Environment)!');
@@ -24,7 +22,6 @@ if (!ADMIN_KEY) {
   console.log('=============================================================\n');
 }
 
-// Глобальний агент для Keep-Alive (зменшує затримку підключення)
 const axiosInstance = axios.create({
   httpsAgent: new https.Agent({ keepAlive: true }),
 });
@@ -43,16 +40,13 @@ const config = {
 };
 
 const stats = { total: 0, success: 0, err429: 0, err5xx: 0, errOther: 0, startTime: Date.now() };
-
-// Пам'ять проксі: моделі, які точно не розуміють thinking
 const unsupportedThinkingModels = new Set();
 
-// ─── Retry логіка + Каскадний Fallback (Розумний фільтр) ───────────────────
+// ─── Retry логіка + Каскадний Fallback (3 рівні) ───────────────────────────
 async function fetchWithRetry(initialData, reqConfig) {
   let attempts5xx = 0;
   let attempts429 = 0;
-  let fallbackLevel = 0; // 0 = оригінал, 1 = без thinking, 2 = тільки базові параметри
-  
+  let fallbackLevel = 0; 
   let currentData = { ...initialData };
 
   while (true) {
@@ -60,33 +54,46 @@ async function fetchWithRetry(initialData, reqConfig) {
       return await axiosInstance({ ...reqConfig, data: currentData });
     } catch (err) {
       const status = err.response?.status;
-      const errMsg = (err.response?.data?.detail ?? err.response?.data?.error?.message ?? '').toLowerCase();
+      const errorData = err.response?.data || {};
+      
+      // Намагаємось витягти точну причину помилки від NIM
+      let exactReason = '';
+      if (typeof errorData.detail === 'string') exactReason = errorData.detail.toLowerCase();
+      else if (errorData.detail) exactReason = JSON.stringify(errorData.detail).toLowerCase();
+      else if (errorData.error?.message) exactReason = errorData.error.message.toLowerCase();
+
+      const isContextError = exactReason.includes('token') || exactReason.includes('context') || exactReason.includes('length');
 
       // --- 400 Каскадний Fallback ---
-      // Якщо помилка пов'язана з токенами (context length), ми НЕ робимо fallback, бо це не допоможе.
-      const isContextError = errMsg.includes('token') || errMsg.includes('context') || errMsg.includes('length');
-
-      if (status === 400 && fallbackLevel < 2 && !isContextError) {
+      if (status === 400 && fallbackLevel < 3 && !isContextError) {
         fallbackLevel++;
         if (fallbackLevel === 1) {
-          console.log(`[Fallback 1] Модель ${currentData.model} ймовірно не підтримує extra_body. Видаляємо...`);
+          console.log(`[Fallback 1] ${currentData.model} - видаляємо extra_body...`);
           unsupportedThinkingModels.add(currentData.model);
           delete currentData.extra_body;
-          continue; // Миттєва повторна спроба
+          continue;
         }
         if (fallbackLevel === 2) {
-          console.log(`[Fallback 2] Модель ${currentData.model} не розуміє RP параметри. Залишаємо тільки базу.`);
-          const safeData = {
+          console.log(`[Fallback 2] ${currentData.model} - залишаємо тільки базові параметри...`);
+          currentData = {
             model: currentData.model,
             messages: currentData.messages,
             temperature: currentData.temperature,
             max_tokens: currentData.max_tokens,
             stream: currentData.stream,
-            top_p: currentData.top_p,
-            stop: currentData.stop
+            top_p: currentData.top_p
           };
-          currentData = safeData;
-          continue; // Миттєва повторна спроба
+          continue;
+        }
+        if (fallbackLevel === 3) {
+          console.log(`[Fallback 3] ${currentData.model} - ГОЛИЙ ЗАПИТ. Відкидаємо абсолютно все, крім messages.`);
+          // Mistral та інші примхливі моделі іноді не сприймають навіть дефолтні max_tokens від клієнта
+          currentData = {
+            model: currentData.model,
+            messages: currentData.messages,
+            stream: currentData.stream
+          };
+          continue;
         }
       }
 
@@ -111,12 +118,13 @@ async function fetchWithRetry(initialData, reqConfig) {
         continue;
       }
 
-      throw err; // Прокидаємо помилку далі, якщо ретраї скінчились або помилка критична
+      // Якщо ретраї скінчились, прокидаємо розширену помилку для логів RP клієнта
+      throw err;
     }
   }
 }
 
-// ─── Повний Адмін HTML ─────────────────────────────────────────────────────
+// ─── Адмін HTML ─────────────────────────────────────────────────────────────
 function buildAdminHtml() {
   return `<!DOCTYPE html>
 <html lang="uk">
@@ -135,7 +143,8 @@ function buildAdminHtml() {
     .stat-lbl{font-size:11px;color:#555;margin-top:2px}
     .stat.err .stat-val{color:#ff4455}
     .stat.warn .stat-val{color:#ffaa00}
-    .card{background:#1a1a24;border-radius:14px;padding:16px;margin-bottom:12px}
+    .card{background:#1a1a24;border-radius:14px;padding:16px;margin-bottom:12px;opacity:0.4;pointer-events:none;transition:0.3s}
+    .card.unlocked{opacity:1;pointer-events:auto}
     .card-title{font-size:12px;text-transform:uppercase;letter-spacing:.8px;color:#76b900;margin-bottom:12px;font-weight:600}
     .row{display:flex;justify-content:space-between;align-items:center;padding:10px 0;border-bottom:1px solid #22222f}
     .row:last-child{border-bottom:none}
@@ -149,11 +158,12 @@ function buildAdminHtml() {
     input:checked+.sl:before{transform:translateX(20px);background:#fff}
     .num{background:#22222f;border:1px solid #2e2e40;color:#fff;padding:6px 10px;border-radius:8px;width:96px;font-size:15px;text-align:right}
     .num:focus{outline:none;border-color:#76b900}
-    #keyWrap{margin-bottom:16px}
-    #keyInput{background:#22222f;border:1px solid #2e2e40;color:#fff;padding:10px 12px;border-radius:10px;width:100%;font-size:15px}
-    #keyInput::placeholder{color:#444}
-    .btn{width:100%;padding:14px;background:#76b900;border:none;border-radius:12px;color:#000;font-size:16px;font-weight:700;cursor:pointer;transition:.1s}
-    .btn:active{opacity:.85}
+    .auth-box{display:flex;gap:8px;margin-bottom:16px}
+    #keyInput{flex:1;background:#22222f;border:1px solid #2e2e40;color:#fff;padding:12px;border-radius:10px;font-size:15px}
+    .btn-auth{padding:0 20px;background:#333344;border:none;border-radius:10px;color:#fff;font-weight:600;cursor:pointer}
+    .btn-auth:active{background:#445}
+    .btn{width:100%;padding:14px;background:#76b900;border:none;border-radius:12px;color:#000;font-size:16px;font-weight:700;cursor:pointer;opacity:0.4;pointer-events:none}
+    .btn.unlocked{opacity:1;pointer-events:auto}
     #status{text-align:center;margin-top:12px;font-size:14px;min-height:20px}
     .ok{color:#76b900}.err{color:#ff4455}
     .uptime{font-size:11px;color:#444;text-align:center;margin-bottom:16px}
@@ -161,144 +171,133 @@ function buildAdminHtml() {
 </head>
 <body>
   <h1>⚙️ NIM RP Proxy</h1>
-  <p class="sub">Зміни живі — без перезапуску</p>
+  <p class="sub">Панель керування</p>
+
+  <div class="auth-box">
+    <input id="keyInput" type="password" placeholder="🔑 Ключ адміна...">
+    <button class="btn-auth" onclick="login()">Увійти</button>
+  </div>
+  <div id="status"></div>
 
   <div class="stats" id="statsGrid">
-    <div class="stat"><div class="stat-val" id="sTotal">—</div><div class="stat-lbl">Всього запитів</div></div>
+    <div class="stat"><div class="stat-val" id="sTotal">—</div><div class="stat-lbl">Запитів</div></div>
     <div class="stat"><div class="stat-val" id="sSuccess">—</div><div class="stat-lbl">Успішних</div></div>
-    <div class="stat warn"><div class="stat-val" id="s429">—</div><div class="stat-lbl">429 (rate limit)</div></div>
-    <div class="stat err"><div class="stat-val" id="s5xx">—</div><div class="stat-lbl">5xx помилки</div></div>
+    <div class="stat warn"><div class="stat-val" id="s429">—</div><div class="stat-lbl">429 Errors</div></div>
+    <div class="stat err"><div class="stat-val" id="s5xx">—</div><div class="stat-lbl">5xx Errors</div></div>
   </div>
   <div class="uptime" id="uptimeEl"></div>
 
-  <div id="keyWrap">
-    <input id="keyInput" type="password" placeholder="🔑 Ключ адміна...">
-  </div>
-
-  <div class="card">
+  <div class="card" id="c1">
     <div class="card-title">🧠 Мислення</div>
     <div class="row">
-      <div><div class="lbl">Режим мислення</div><div class="desc">Надсилати thinking в NIM</div></div>
+      <div><div class="lbl">Режим мислення</div></div>
       <label class="toggle"><input type="checkbox" id="enableThinking"><span class="sl"></span></label>
     </div>
     <div class="row">
-      <div><div class="lbl">Показувати мислення</div><div class="desc">Включати &lt;think&gt; у відповідь</div></div>
+      <div><div class="lbl">Показувати &lt;think&gt;</div></div>
       <label class="toggle"><input type="checkbox" id="showReasoning"><span class="sl"></span></label>
     </div>
   </div>
 
-  <div class="card">
-    <div class="card-title">🔁 Retry при 429 (rate limit)</div>
-    <div class="row">
-      <div><div class="lbl">Кількість спроб</div><div class="desc">0 = не повторювати</div></div>
-      <input class="num" type="number" id="max429Retries" min="0" max="10">
-    </div>
-    <div class="row">
-      <div><div class="lbl">Пауза (мс)</div><div class="desc">Якщо NIM не вказав Retry-After</div></div>
-      <input class="num" type="number" id="retry429DelayMs" min="500" step="500">
-    </div>
+  <div class="card" id="c2">
+    <div class="card-title">🔁 Retry налаштування</div>
+    <div class="row"><div><div class="lbl">Спроби при 429</div></div><input class="num" type="number" id="max429Retries"></div>
+    <div class="row"><div><div class="lbl">Спроби при 5xx</div></div><input class="num" type="number" id="maxRetries"></div>
   </div>
 
-  <div class="card">
-    <div class="card-title">🔁 Retry при 5xx (помилка сервера)</div>
-    <div class="row">
-      <div><div class="lbl">Кількість спроб</div><div class="desc">0 = не повторювати</div></div>
-      <input class="num" type="number" id="maxRetries" min="0" max="5">
-    </div>
-    <div class="row">
-      <div><div class="lbl">Пауза (мс)</div><div class="desc">Початкова, подвоюється</div></div>
-      <input class="num" type="number" id="retryDelayMs" min="100" step="100">
-    </div>
+  <div class="card" id="c3">
+    <div class="card-title">🎛️ Дефолти</div>
+    <div class="row"><div><div class="lbl">Температура</div></div><input class="num" type="number" id="defaultTemperature" step="0.1"></div>
+    <div class="row"><div><div class="lbl">Макс. токени</div></div><input class="num" type="number" id="defaultMaxTokens"></div>
   </div>
 
-  <div class="card">
-    <div class="card-title">🎛️ Дефолти (RP Клієнт пріоритетніший)</div>
-    <div class="row">
-      <div><div class="lbl">Температура</div></div>
-      <input class="num" type="number" id="defaultTemperature" min="0" max="2" step="0.05">
-    </div>
-    <div class="row">
-      <div><div class="lbl">Макс. токени</div></div>
-      <input class="num" type="number" id="defaultMaxTokens" min="256" step="256">
-    </div>
-    <div class="row">
-      <div><div class="lbl">Таймаут (мс)</div><div class="desc">Тільки для не-стрімових</div></div>
-      <input class="num" type="number" id="timeoutMs" min="10000" step="5000">
-    </div>
-  </div>
-
-  <button class="btn" onclick="save()">💾 Зберегти</button>
-  <div id="status"></div>
+  <button class="btn" id="saveBtn" onclick="save()">💾 Зберегти конфіг</button>
 
   <script>
     const $ = id => document.getElementById(id);
     const statusEl = $('status');
+    let refreshInterval = null;
 
-    function fmtUptime(ms) {
-      const s = Math.floor(ms/1000), m = Math.floor(s/60), h = Math.floor(m/60), d = Math.floor(h/24);
-      if (d > 0) return d + 'д ' + (h%24) + 'г';
-      if (h > 0) return h + 'г ' + (m%60) + 'хв';
-      if (m > 0) return m + 'хв ' + (s%60) + 'с';
-      return s + 'с';
+    // Відновлюємо ключ з пам'яті
+    window.onload = () => {
+      const saved = localStorage.getItem('nim_key');
+      if (saved) { $('keyInput').value = saved; login(); }
+    };
+
+    function unlockUI() {
+      $('c1').classList.add('unlocked');
+      $('c2').classList.add('unlocked');
+      $('c3').classList.add('unlocked');
+      $('saveBtn').classList.add('unlocked');
     }
 
-    async function loadStats() {
-      try {
-        const s = await fetch('/admin/stats').then(r => r.json());
-        $('sTotal').textContent = s.total;
-        $('sSuccess').textContent = s.success;
-        $('s429').textContent = s.err429;
-        $('s5xx').textContent = s.err5xx;
-        $('uptimeEl').textContent = 'Аптайм: ' + fmtUptime(s.uptimeMs);
-      } catch {}
-    }
-
-    async function load() {
-      try {
-        const c = await fetch('/admin/config').then(r => r.json());
-        $('enableThinking').checked  = c.enableThinking;
-        $('showReasoning').checked   = c.showReasoning;
-        $('maxRetries').value        = c.maxRetries;
-        $('retryDelayMs').value      = c.retryDelayMs;
-        $('max429Retries').value     = c.max429Retries;
-        $('retry429DelayMs').value   = c.retry429DelayMs;
-        $('defaultTemperature').value = c.defaultTemperature;
-        $('defaultMaxTokens').value  = c.defaultMaxTokens;
-        $('timeoutMs').value         = c.timeoutMs;
-      } catch { statusEl.innerHTML = '<span class="err">Не вдалося завантажити конфіг</span>'; }
-    }
-
-    async function save() {
-      const body = {
-        enableThinking:     $('enableThinking').checked,
-        showReasoning:      $('showReasoning').checked,
-        maxRetries:         +$('maxRetries').value,
-        retryDelayMs:       +$('retryDelayMs').value,
-        max429Retries:      +$('max429Retries').value,
-        retry429DelayMs:    +$('retry429DelayMs').value,
-        defaultTemperature: +$('defaultTemperature').value,
-        defaultMaxTokens:   +$('defaultMaxTokens').value,
-        timeoutMs:          +$('timeoutMs').value,
-      };
-      const headers = { 'Content-Type': 'application/json' };
-      const ki = $('keyInput');
-      if (ki) headers['x-admin-key'] = ki.value;
+    async function login() {
+      const key = $('keyInput').value.trim();
+      if (!key) return;
       
       try {
-        const r = await fetch('/admin/config', { method: 'POST', headers, body: JSON.stringify(body) });
+        const r = await fetch('/admin/config', { headers: { 'x-admin-key': key } });
         if (r.ok) {
-          statusEl.innerHTML = '<span class="ok">✓ Збережено</span>';
-          setTimeout(() => statusEl.innerHTML = '', 2500);
+          localStorage.setItem('nim_key', key);
+          statusEl.innerHTML = '<span class="ok">✓ Авторизовано</span>';
+          unlockUI();
+          
+          const c = await r.json();
+          $('enableThinking').checked  = c.enableThinking;
+          $('showReasoning').checked   = c.showReasoning;
+          $('maxRetries').value        = c.maxRetries;
+          $('max429Retries').value     = c.max429Retries;
+          $('defaultTemperature').value = c.defaultTemperature;
+          $('defaultMaxTokens').value  = c.defaultMaxTokens;
+
+          loadStats();
+          if(refreshInterval) clearInterval(refreshInterval);
+          refreshInterval = setInterval(loadStats, 5000);
+          setTimeout(() => statusEl.innerHTML='', 2000);
         } else {
-          const e = await r.json();
-          statusEl.innerHTML = '<span class="err">' + (e.error || 'Помилка доступу') + '</span>';
+          statusEl.innerHTML = '<span class="err">❌ Невірний ключ</span>';
         }
       } catch { statusEl.innerHTML = '<span class="err">Помилка мережі</span>'; }
     }
 
-    load();
-    loadStats();
-    setInterval(loadStats, 10000);
+    async function loadStats() {
+      const key = localStorage.getItem('nim_key');
+      if (!key) return;
+      try {
+        const s = await fetch('/admin/stats', { headers: { 'x-admin-key': key } }).then(r => r.json());
+        $('sTotal').textContent = s.total;
+        $('sSuccess').textContent = s.success;
+        $('s429').textContent = s.err429;
+        $('s5xx').textContent = s.err5xx;
+        $('uptimeEl').textContent = 'Аптайм: ' + Math.floor(s.uptimeMs/60000) + ' хв';
+      } catch {}
+    }
+
+    async function save() {
+      const key = localStorage.getItem('nim_key');
+      const body = {
+        enableThinking:     $('enableThinking').checked,
+        showReasoning:      $('showReasoning').checked,
+        maxRetries:         +$('maxRetries').value,
+        max429Retries:      +$('max429Retries').value,
+        defaultTemperature: +$('defaultTemperature').value,
+        defaultMaxTokens:   +$('defaultMaxTokens').value,
+      };
+      
+      try {
+        const r = await fetch('/admin/config', { 
+          method: 'POST', 
+          headers: { 'Content-Type': 'application/json', 'x-admin-key': key }, 
+          body: JSON.stringify(body) 
+        });
+        if (r.ok) {
+          statusEl.innerHTML = '<span class="ok">✓ Збережено</span>';
+          setTimeout(() => statusEl.innerHTML = '', 2000);
+        } else {
+          statusEl.innerHTML = '<span class="err">Помилка доступу</span>';
+        }
+      } catch { statusEl.innerHTML = '<span class="err">Помилка мережі</span>'; }
+    }
   </script>
 </body>
 </html>`;
@@ -312,7 +311,6 @@ app.get('/admin', (req, res) => {
   res.send(buildAdminHtml());
 });
 
-// Захист всіх /admin API маршрутів
 app.use('/admin/*', (req, res, next) => {
   if (req.headers['x-admin-key'] !== ADMIN_KEY) return res.status(403).json({ error: 'Невірний ключ' });
   next();
@@ -342,14 +340,12 @@ app.post('/v1/chat/completions', async (req, res) => {
 
   stats.total++;
 
-  // КЛІЄНТ — БОС: прокидаємо всі його параметри (top_k, min_p, stream_options тощо).
   const nimBody = {
     temperature: config.defaultTemperature,
     max_tokens: config.defaultMaxTokens,
     ...req.body,
   };
 
-  // Розумне додавання мислення (тільки якщо модель ще не відхилила це раніше)
   if (config.enableThinking && !unsupportedThinkingModels.has(model)) {
     nimBody.extra_body = { ...(nimBody.extra_body || {}), chat_template_kwargs: { thinking: true } };
   }
@@ -360,7 +356,6 @@ app.post('/v1/chat/completions', async (req, res) => {
       url: `${NIM_API_BASE}/chat/completions`,
       headers: { 'Authorization': `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
       responseType: nimBody.stream ? 'stream' : 'json',
-      // У стрімінгу вимикаємо таймаут Axios, щоб не обривати довгі роздуми
       timeout: nimBody.stream ? 0 : config.timeoutMs, 
     });
 
@@ -371,21 +366,19 @@ app.post('/v1/chat/completions', async (req, res) => {
       res.setHeader('Cache-Control', 'no-cache');
       res.setHeader('Connection', 'keep-alive');
 
-      // Graceful shutdown & Client Abort Protection
       const onClientClose = () => { response.data.destroy(); };
       req.on('close', onClientClose);
 
       const onAppTerminate = () => { response.data.destroy(); res.end(); };
       process.once('SIGTERM', onAppTerminate);
 
-      // Декодер для кирилиці та емодзі
       const decoder = new TextDecoder('utf-8');
       let buffer = '', inReasoning = false;
 
       response.data.on('data', chunk => {
         buffer += decoder.decode(chunk, { stream: true });
         const lines = buffer.split('\n');
-        buffer = lines.pop() ?? ''; // Зберігаємо неповний рядок для наступного чанку
+        buffer = lines.pop() ?? ''; 
 
         for (const line of lines) {
           const t = line.trim();
@@ -407,7 +400,7 @@ app.post('/v1/chat/completions', async (req, res) => {
                 else if (c) out += c;
                 delta.content = out || '';
               } else {
-                if (rc && !c) continue; // Ховаємо роздуми
+                if (rc && !c) continue; 
                 delta.content = c ?? '';
               }
               delete delta.reasoning_content;
@@ -440,21 +433,34 @@ app.post('/v1/chat/completions', async (req, res) => {
     }
 
   } catch (err) {
-    if (res.headersSent) {
-      return res.end(); // Якщо помилка під час стріму, закриваємо його тихо
-    }
+    if (res.headersSent) return res.end();
+    
     const status = err.response?.status ?? 500;
-    const message = err.response?.data?.detail ?? err.response?.data?.error?.message ?? err.message ?? 'Невідома помилка';
+    
+    // Покращений парсинг помилки, щоб ти точно бачив, на що свариться Mistral
+    let message = 'Невідома помилка проксі';
+    const errorData = err.response?.data;
+    
+    if (errorData) {
+      if (typeof errorData === 'string') message = errorData;
+      else if (errorData.detail) {
+        message = typeof errorData.detail === 'string' ? errorData.detail : JSON.stringify(errorData.detail);
+      }
+      else if (errorData.error?.message) message = errorData.error.message;
+    } else if (err.message) {
+      message = err.message;
+    }
+
     if (status !== 429 && status < 500) stats.errOther++;
-    console.error(`[${status}] ${JSON.stringify(message)}`);
-    res.status(status).json({ error: { message, code: status } });
+    console.error(`[${status}] Proxy Error: ${message}`);
+    
+    // Відправляємо відформатовану помилку в твій RP-клієнт
+    res.status(status).json({ error: { message: `Proxy Error ${status}: ${message}`, code: status } });
   }
 });
 
-// 404 обробник
 app.all('*', (req, res) => res.status(404).json({ error: { message: `Ендпоінт ${req.path} не знайдено` } }));
 
-// ─── Graceful shutdown ─────────────────────────────────────────────────────
 process.on('SIGTERM', () => {
   console.log('SIGTERM отримано, завершую...');
   setTimeout(() => process.exit(0), 3000);
