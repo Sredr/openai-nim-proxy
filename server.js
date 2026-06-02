@@ -14,7 +14,20 @@ const upload = multer({
 });
 
 const NIM_API_BASE = 'https://integrate.api.nvidia.com/v1';
-const ADMIN_KEY = process.env.ADMIN_KEY ?? '';
+const { randomUUID } = require('crypto');
+
+let ADMIN_KEY = process.env.ADMIN_KEY ?? '';
+if (!ADMIN_KEY) {
+  ADMIN_KEY = randomUUID();
+  console.log('');
+  console.log('╔══════════════════════════════════════════════════╗');
+  console.log('║         🔑 ADMIN KEY (згенеровано авто)          ║');
+  console.log(`║  ${ADMIN_KEY}  ║`);
+  console.log('╚══════════════════════════════════════════════════╝');
+  console.log('');
+} else {
+  console.log('🔑 ADMIN_KEY завантажено з env');
+}
 
 // ─── Живий конфіг ──────────────────────────────────────────────────────────
 const config = {
