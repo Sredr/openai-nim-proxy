@@ -92,16 +92,43 @@ function extractApiKey(req) {
   return keys[Math.floor(Math.random() * keys.length)];
 }
 
+// ─── Безпечний stringify (захист від циклічних структур axios) ─────────────
+function safeStringify(val) {
+  try {
+    return JSON.stringify(val);
+  } catch {
+    // Циклічна структура — витягуємо тільки рядкові поля
+    if (val && typeof val === 'object') {
+      const safe = {};
+      for (const k of ['message', 'code', 'detail', 'type', 'status']) {
+        if (val[k] !== undefined && typeof val[k] !== 'object') safe[k] = val[k];
+      }
+      return JSON.stringify(safe);
+    }
+    return String(val);
+  }
+}
+
 // ─── Хелпер: стандартна обробка помилок ───────────────────────────────────
 function handleError(err, res) {
   const status = err.response?.status ?? 500;
   const rawData = err.response?.data;
+
   let message = 'Помилка';
-  if (rawData?.detail) message = typeof rawData.detail === 'string' ? rawData.detail : JSON.stringify(rawData.detail);
-  else if (rawData?.error?.message) message = rawData.error.message;
-  else message = err.message;
+  if (rawData?.detail) {
+    message = typeof rawData.detail === 'string' ? rawData.detail : safeStringify(rawData.detail);
+  } else if (rawData?.error?.message) {
+    message = rawData.error.message;
+  } else if (typeof err.message === 'string') {
+    message = err.message;
+  }
+
   if (status !== 429 && status < 500) stats.errOther++;
-  console.error(`[${status}]`, JSON.stringify(rawData ?? err.message));
+
+  // Безпечний лог — не падає на циклічних структурах
+  const logData = rawData !== undefined ? safeStringify(rawData) : `"${err.message}"`;
+  console.error(`[${status}]`, logData);
+
   if (!res.headersSent) res.status(status).json({ error: { message, code: status } });
 }
 
@@ -438,248 +465,4 @@ app.post('/v1/chat/completions', async (req, res) => {
                 delta.content = out || '';
               } else {
                 if (rc && !c) continue;
-                delta.content = c ?? '';
-              }
-              delete delta.reasoning_content;
-            }
-            res.write(`data: ${JSON.stringify(data)}\n\n`);
-          } catch {}
-        }
-      });
-      response.data.on('end', () => res.end());
-      response.data.on('error', () => res.end());
-    } else {
-      const data = response.data;
-      for (const choice of data.choices ?? []) {
-        const msg = choice.message;
-        if (!msg) continue;
-        if (config.showReasoning && msg.reasoning_content)
-          msg.content = `<think>\n${msg.reasoning_content}\n</think>\n\n${msg.content ?? ''}`;
-        delete msg.reasoning_content;
-      }
-      res.json(data);
-    }
-  } catch (err) { handleError(err, res); }
-});
-
-// ─── POST /v1/completions (legacy) ──────────────────────────────────────────
-app.post('/v1/completions', async (req, res) => {
-  const apiKey = extractApiKey(req);
-  if (!apiKey) return res.status(401).json({ error: { message: 'Відсутній API ключ', code: 401 } });
-
-  stats.total++;
-  trackEndpoint('POST /v1/completions');
-
-  try {
-    const response = await fetchWithRetry({
-      method: 'post',
-      url: `${NIM_API_BASE}/completions`,
-      data: req.body,
-      headers: { 'Authorization': `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
-      responseType: req.body.stream ? 'stream' : 'json',
-      timeout: config.timeoutMs,
-    });
-    stats.success++;
-    if (req.body.stream) {
-      res.setHeader('Content-Type', 'text/event-stream');
-      res.setHeader('Cache-Control', 'no-cache');
-      response.data.pipe(res);
-    } else {
-      res.json(response.data);
-    }
-  } catch (err) { handleError(err, res); }
-});
-
-// ─── POST /v1/embeddings ─────────────────────────────────────────────────────
-app.post('/v1/embeddings', async (req, res) => {
-  const apiKey = extractApiKey(req);
-  if (!apiKey) return res.status(401).json({ error: { message: 'Відсутній API ключ', code: 401 } });
-  if (!req.body.model || req.body.input === undefined)
-    return res.status(400).json({ error: { message: 'model і input обовязкові', code: 400 } });
-
-  stats.total++;
-  trackEndpoint('POST /v1/embeddings');
-
-  try {
-    const response = await fetchWithRetry({
-      method: 'post',
-      url: `${NIM_API_BASE}/embeddings`,
-      data: req.body,
-      headers: { 'Authorization': `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
-      timeout: config.timeoutMs,
-    });
-    stats.success++;
-    res.json(response.data);
-  } catch (err) { handleError(err, res); }
-});
-
-// ─── POST /v1/images/generations ─────────────────────────────────────────────
-app.post('/v1/images/generations', async (req, res) => {
-  const apiKey = extractApiKey(req);
-  if (!apiKey) return res.status(401).json({ error: { message: 'Відсутній API ключ', code: 401 } });
-  if (!req.body.model || !req.body.prompt)
-    return res.status(400).json({ error: { message: 'model і prompt обовязкові', code: 400 } });
-
-  stats.total++;
-  trackEndpoint('POST /v1/images/generations');
-
-  try {
-    const response = await fetchWithRetry({
-      method: 'post',
-      url: `${NIM_API_BASE}/images/generations`,
-      data: req.body,
-      headers: { 'Authorization': `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
-      timeout: config.timeoutMs,
-    });
-    stats.success++;
-    res.json(response.data);
-  } catch (err) { handleError(err, res); }
-});
-
-// ─── POST /v1/audio/transcriptions (STT) ─────────────────────────────────────
-// Приймає multipart/form-data з полем "file"
-app.post('/v1/audio/transcriptions', upload.single('file'), async (req, res) => {
-  const apiKey = extractApiKey(req);
-  if (!apiKey) return res.status(401).json({ error: { message: 'Відсутній API ключ', code: 401 } });
-  if (!req.file) return res.status(400).json({ error: { message: 'Файл аудіо обовязковий (поле "file")', code: 400 } });
-  if (!req.body.model) return res.status(400).json({ error: { message: 'model обовязкова', code: 400 } });
-
-  stats.total++;
-  trackEndpoint('POST /v1/audio/transcriptions');
-
-  const form = new FormData();
-  form.append('file', req.file.buffer, {
-    filename: req.file.originalname || 'audio.wav',
-    contentType: req.file.mimetype,
-  });
-  form.append('model', req.body.model);
-  if (req.body.language) form.append('language', req.body.language);
-  if (req.body.response_format) form.append('response_format', req.body.response_format);
-  if (req.body.temperature) form.append('temperature', req.body.temperature);
-
-  try {
-    const response = await fetchWithRetry({
-      method: 'post',
-      url: `${NIM_API_BASE}/audio/transcriptions`,
-      data: form,
-      headers: { 'Authorization': `Bearer ${apiKey}`, ...form.getHeaders() },
-      timeout: config.timeoutMs,
-    });
-    stats.success++;
-    res.json(response.data);
-  } catch (err) { handleError(err, res); }
-});
-
-// ─── POST /v1/audio/translations ─────────────────────────────────────────────
-app.post('/v1/audio/translations', upload.single('file'), async (req, res) => {
-  const apiKey = extractApiKey(req);
-  if (!apiKey) return res.status(401).json({ error: { message: 'Відсутній API ключ', code: 401 } });
-  if (!req.file) return res.status(400).json({ error: { message: 'Файл аудіо обовязковий', code: 400 } });
-
-  stats.total++;
-  trackEndpoint('POST /v1/audio/translations');
-
-  const form = new FormData();
-  form.append('file', req.file.buffer, { filename: req.file.originalname || 'audio.wav', contentType: req.file.mimetype });
-  if (req.body.model) form.append('model', req.body.model);
-  if (req.body.response_format) form.append('response_format', req.body.response_format);
-
-  try {
-    const response = await fetchWithRetry({
-      method: 'post',
-      url: `${NIM_API_BASE}/audio/translations`,
-      data: form,
-      headers: { 'Authorization': `Bearer ${apiKey}`, ...form.getHeaders() },
-      timeout: config.timeoutMs,
-    });
-    stats.success++;
-    res.json(response.data);
-  } catch (err) { handleError(err, res); }
-});
-
-// ─── POST /v1/audio/speech (TTS) ─────────────────────────────────────────────
-// Повертає аудіо файл (binary stream)
-app.post('/v1/audio/speech', async (req, res) => {
-  const apiKey = extractApiKey(req);
-  if (!apiKey) return res.status(401).json({ error: { message: 'Відсутній API ключ', code: 401 } });
-  if (!req.body.model || !req.body.input)
-    return res.status(400).json({ error: { message: 'model і input обовязкові', code: 400 } });
-
-  stats.total++;
-  trackEndpoint('POST /v1/audio/speech');
-
-  try {
-    const response = await fetchWithRetry({
-      method: 'post',
-      url: `${NIM_API_BASE}/audio/speech`,
-      data: req.body,
-      headers: { 'Authorization': `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
-      responseType: 'stream',
-      timeout: config.timeoutMs,
-    });
-    stats.success++;
-    // Прокидуємо Content-Type від NIM (mp3, wav, opus, etc.)
-    const ct = response.headers['content-type'] ?? 'audio/mpeg';
-    res.setHeader('Content-Type', ct);
-    if (response.headers['content-disposition'])
-      res.setHeader('Content-Disposition', response.headers['content-disposition']);
-    response.data.pipe(res);
-  } catch (err) { handleError(err, res); }
-});
-
-// ─── UNIVERSAL PASS-THROUGH для /v1/* ────────────────────────────────────────
-// Це покриє Drug Discovery, Object Detection, OCR, Digital Twin, і все інше
-// що має JSON тіло або query params. Файли НЕ підтримуються тут — тільки JSON.
-app.all('/v1/*', async (req, res) => {
-  const apiKey = extractApiKey(req);
-  if (!apiKey) return res.status(401).json({ error: { message: 'Відсутній API ключ', code: 401 } });
-
-  const nimPath = req.path; // вже /v1/...
-  const isStream = req.body?.stream === true;
-  const endpoint = `${req.method} ${nimPath}`;
-
-  stats.total++;
-  trackEndpoint(endpoint);
-  console.log(`[pass-through] ${endpoint}`);
-
-  try {
-    const response = await fetchWithRetry({
-      method: req.method.toLowerCase(),
-      url: `${NIM_API_BASE}${nimPath}`,
-      data: ['GET', 'HEAD'].includes(req.method) ? undefined : req.body,
-      params: req.query,
-      headers: {
-        'Authorization': `Bearer ${apiKey}`,
-        'Content-Type': 'application/json',
-      },
-      responseType: isStream ? 'stream' : 'json',
-      timeout: config.timeoutMs,
-    });
-
-    stats.success++;
-
-    if (isStream) {
-      res.setHeader('Content-Type', response.headers['content-type'] ?? 'text/event-stream');
-      res.setHeader('Cache-Control', 'no-cache');
-      response.data.pipe(res);
-    } else {
-      // Копіюємо важливі заголовки відповіді
-      const ct = response.headers['content-type'];
-      if (ct) res.setHeader('Content-Type', ct);
-      res.status(response.status).json(response.data);
-    }
-  } catch (err) { handleError(err, res); }
-});
-
-// ─── 404 ─────────────────────────────────────────────────────────────────────
-app.all('*', (req, res) => res.status(404).json({
-  error: { message: `Ендпоінт ${req.path} не знайдено. Всі NIM ендпоінти доступні через /v1/*` }
-}));
-
-// ─── Graceful shutdown ────────────────────────────────────────────────────────
-process.on('SIGTERM', () => {
-  console.log('SIGTERM отримано, завершую...');
-  setTimeout(() => process.exit(0), 3000);
-});
-
-app.listen(PORT, () => console.log(`✅ NIM Universal Proxy на порту ${PORT} | /admin для налаштувань`));
+                
