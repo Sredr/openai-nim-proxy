@@ -2,6 +2,7 @@ const express = require('express');
 const cors = require('cors');
 const axios = require('axios');
 const https = require('https');
+const crypto = require('crypto'); // Додано для генерації ключів
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -11,7 +12,17 @@ app.use(cors());
 app.use(express.json({ limit: '50mb' })); 
 
 const NIM_API_BASE = 'https://integrate.api.nvidia.com/v1';
-const ADMIN_KEY = process.env.ADMIN_KEY ?? '';
+
+// ─── Генеративний Адмін-Ключ ───────────────────────────────────────────────
+let ADMIN_KEY = process.env.ADMIN_KEY;
+if (!ADMIN_KEY) {
+  // Генеруємо випадковий 12-значний hex-рядок (наприклад: 8f4e2a1b9c3d)
+  ADMIN_KEY = crypto.randomBytes(6).toString('hex');
+  console.log('\n=============================================================');
+  console.log('⚠️ Змінну ADMIN_KEY не задано в середовищі (Environment)!');
+  console.log(`🔑 Згенеровано тимчасовий адмін-ключ для цієї сесії: ${ADMIN_KEY}`);
+  console.log('=============================================================\n');
+}
 
 // Глобальний агент для Keep-Alive (зменшує затримку підключення)
 const axiosInstance = axios.create({
@@ -160,9 +171,9 @@ function buildAdminHtml() {
   </div>
   <div class="uptime" id="uptimeEl"></div>
 
-  ${ADMIN_KEY ? `<div id="keyWrap">
+  <div id="keyWrap">
     <input id="keyInput" type="password" placeholder="🔑 Ключ адміна...">
-  </div>` : '<div style="color:#ffaa00; font-size:12px; margin-bottom:16px; text-align:center">⚠️ ADMIN_KEY не задано. Збереження недоступне.</div>'}
+  </div>
 
   <div class="card">
     <div class="card-title">🧠 Мислення</div>
@@ -303,7 +314,6 @@ app.get('/admin', (req, res) => {
 
 // Захист всіх /admin API маршрутів
 app.use('/admin/*', (req, res, next) => {
-  if (!ADMIN_KEY) return res.status(403).json({ error: 'Адмін-панель заблокована. Встановіть ADMIN_KEY.' });
   if (req.headers['x-admin-key'] !== ADMIN_KEY) return res.status(403).json({ error: 'Невірний ключ' });
   next();
 });
@@ -451,4 +461,3 @@ process.on('SIGTERM', () => {
 });
 
 app.listen(PORT, () => console.log(`✅ RP-Проксі на порту ${PORT} | /admin для налаштувань`));
-    
