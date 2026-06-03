@@ -26,10 +26,12 @@ function cleanResponse(data, config) {
           choice.message.content = content;
         }
       } else {
+        const { thought, content } = extractThoughtTags(choice.message.content || '');
         delete choice.message.reasoning_content;
-        if (choice.message.content) {
-          const { content } = extractThoughtTags(choice.message.content);
+        if (content) {
           choice.message.content = content;
+        } else if (thought) {
+          choice.message.content = thought;
         }
       }
     }
@@ -52,14 +54,13 @@ function parseStream(data, res, config) {
         delete delta.extra_content;
         const c = delta.content;
 
-        if (config.showReasoning) {
-          // Збираємо chunk в буфер, шукаємо <thought>
-          if (!res.thoughtBuf) res.thoughtBuf = '';
-          if (c) res.thoughtBuf += c;
+        if (!res.thoughtBuf) res.thoughtBuf = '';
+        if (c) res.thoughtBuf += c;
 
-          const thoughtEnd = res.thoughtBuf.indexOf('</thought>');
+        const thoughtEnd = res.thoughtBuf.indexOf('</thought>');
+        
+        if (config.showReasoning) {
           if (thoughtEnd !== -1) {
-            // Є закритий тег — витягуємо думки
             const before = res.thoughtBuf.slice(0, thoughtEnd);
             const thought = before.replace(/<thought>/g, '').trim();
             const after = res.thoughtBuf.slice(thoughtEnd + '</thought>'.length);
@@ -73,36 +74,34 @@ function parseStream(data, res, config) {
             res.thoughtBuf = '';
             continue;
           }
-
           if (res.thoughtBuf.includes('<thought>') && !res.thoughtBuf.includes('</thought>')) {
-            // Ще не закрили — буферизуємо
             continue;
           }
-
-          // Звичайний контент
           if (c) {
             res.write(`data: ${JSON.stringify(parsed)}\n\n`);
           }
         } else {
-          if (!config.showReasoning) {
-            if (c && c.includes('<thought>')) {
-              // showReasoning=false: прибираємо <thought> блоки
-              if (!res.thoughtBuf) res.thoughtBuf = '';
-              res.thoughtBuf += c;
-              const thoughtEnd = res.thoughtBuf.indexOf('</thought>');
-              if (thoughtEnd !== -1) {
-                const after = res.thoughtBuf.slice(thoughtEnd + '</thought>'.length);
-                if (after) {
-                  delta.content = after;
-                  res.write(`data: ${JSON.stringify(parsed)}\n\n`);
-                }
-                res.thoughtBuf = '';
+          if (thoughtEnd !== -1) {
+            const after = res.thoughtBuf.slice(thoughtEnd + '</thought>'.length);
+            if (after) {
+              delta.content = after;
+              res.write(`data: ${JSON.stringify(parsed)}\n\n`);
+            } else {
+              // Вся відповідь в <thought> — пишемо контент
+              const before = res.thoughtBuf.slice(0, thoughtEnd).replace(/<thought>/g, '').trim();
+              if (before) {
+                delta.content = before;
+                res.write(`data: ${JSON.stringify(parsed)}\n\n`);
               }
-              continue;
             }
-            delete delta.reasoning_content;
-            delta.content = c ?? '';
+            res.thoughtBuf = '';
+            continue;
           }
+          if (res.thoughtBuf.includes('<thought>') && !res.thoughtBuf.includes('</thought>')) {
+            continue;
+          }
+          delete delta.reasoning_content;
+          delta.content = c ?? '';
           res.write(`data: ${JSON.stringify(parsed)}\n\n`);
         }
       } else {
