@@ -45,26 +45,7 @@ module.exports = {
       const t = line.trim();
       if (!t) continue;
 
-      // ─── БАГ 1 ВИПРАВЛЕНО: було 'data:' — ніколи не матчило реальний [DONE] ───
       if (t === 'data: [DONE]') {
-        // Скидаємо залишок буферу якщо є
-        const remaining = res.thoughtBuf || '';
-        if (remaining.trim()) {
-          if (config.showReasoning && !res.thoughtFlushed) {
-            const thought = remaining.replace(/<\/?thought>/g, '').trim();
-            if (thought) {
-              res.thoughtFlushed = true;
-              res.write(`data: ${JSON.stringify({ choices: [{ delta: { reasoning_content: thought, role: 'assistant' }, finish_reason: 'stop', index: 0 }] })}\n\n`);
-            }
-          } else if (!config.showReasoning) {
-            // Викидаємо незакриті thought-теги, відправляємо решту як content
-            const clean = remaining.replace(/<thought>[\s\S]*$/g, '').trim();
-            if (clean) {
-              res.write(`data: ${JSON.stringify({ choices: [{ delta: { content: clean, role: 'assistant' }, index: 0 }] })}\n\n`);
-            }
-          }
-        }
-        res.thoughtBuf = '';
         res.write('data: [DONE]\n\n');
         continue;
       }
@@ -75,73 +56,52 @@ module.exports = {
         const parsed = JSON.parse(t.slice(6));
         const delta = parsed.choices?.[0]?.delta;
 
-        if (!delta) {
+        if (!delta || delta.content == null) {
           res.write(`data: ${JSON.stringify(parsed)}\n\n`);
           continue;
         }
 
-        delete delta.extra_content;
-        const c = delta.content;
+        let content = delta.content;
+        
+        // State Machine для миттєвого стрімінгу без затримок
+        if (res.isThinking === undefined) res.isThinking = false;
 
-        // Upstream вже повертає reasoning_content — пропускаємо наскрізь
-        if (delta.reasoning_content) {
-          if (config.showReasoning) res.write(`data: ${JSON.stringify(parsed)}\n\n`);
-          continue;
-        }
-
-        // Чанк без content (finish_reason тощо) — відправляємо як є
-        if (c == null) {
-          res.write(`data: ${JSON.stringify(parsed)}\n\n`);
-          continue;
-        }
-
-        // ─── Логіка обробки <thought> тегів ───
-        if (!res.thoughtBuf) res.thoughtBuf = '';
-        res.thoughtBuf += c;
-
-        const thoughtStart = res.thoughtBuf.indexOf('<thought>');
-        const thoughtEnd   = res.thoughtBuf.indexOf('</thought>');
-
-        // Знайдено повний блок <thought>...</thought>
-        if (thoughtStart !== -1 && thoughtEnd !== -1) {
-          const before  = res.thoughtBuf.slice(0, thoughtStart);
-          const thought  = res.thoughtBuf.slice(thoughtStart + '<thought>'.length, thoughtEnd).trim();
-          const after    = res.thoughtBuf.slice(thoughtEnd + '</thought>'.length);
-          res.thoughtBuf = '';
-
-          if (config.showReasoning) {
-            if (before) res.write(`data: ${JSON.stringify({ choices: [{ delta: { content: before, role: 'assistant' }, index: 0 }] })}\n\n`);
-            if (thought && !res.thoughtFlushed) {
-              res.thoughtFlushed = true;
-              res.write(`data: ${JSON.stringify({ choices: [{ delta: { reasoning_content: thought, role: 'assistant' }, index: 0 }] })}\n\n`);
+        while (content.length > 0) {
+          if (!res.isThinking) {
+            const startIdx = content.indexOf('<thought>');
+            if (startIdx === -1) {
+              // Звичайний текст, відправляємо одразу
+              res.write(`data: ${JSON.stringify({ choices: [{ delta: { content: content, role: 'assistant' }, index: 0 }] })}\n\n`);
+              content = '';
+            } else {
+              // Відправляємо текст ДО тегу, перемикаємось в режим reasoning
+              const before = content.slice(0, startIdx);
+              if (before) {
+                res.write(`data: ${JSON.stringify({ choices: [{ delta: { content: before, role: 'assistant' }, index: 0 }] })}\n\n`);
+              }
+              content = content.slice(startIdx + '<thought>'.length);
+              res.isThinking = true;
             }
-            if (after) res.write(`data: ${JSON.stringify({ choices: [{ delta: { content: after, role: 'assistant' }, index: 0 }] })}\n\n`);
           } else {
-            // Викидаємо thought, відправляємо тільки до і після
-            const toSend = before + after;
-            if (toSend) {
-              delete delta.reasoning_content;
-              delta.content = toSend;
-              res.write(`data: ${JSON.stringify(parsed)}\n\n`);
+            const endIdx = content.indexOf('</thought>');
+            if (endIdx === -1) {
+              // Ми все ще в блоці думок, стрімимо як reasoning_content
+              if (config.showReasoning) {
+                res.write(`data: ${JSON.stringify({ choices: [{ delta: { reasoning_content: content, role: 'assistant' }, index: 0 }] })}\n\n`);
+              }
+              content = '';
+            } else {
+              // Думки закінчились, відправляємо останній шматок думок і перемикаємось
+              const thought = content.slice(0, endIdx);
+              if (config.showReasoning && thought) {
+                res.write(`data: ${JSON.stringify({ choices: [{ delta: { reasoning_content: thought, role: 'assistant' }, index: 0 }] })}\n\n`);
+              }
+              content = content.slice(endIdx + '</thought>'.length);
+              res.isThinking = false;
             }
           }
-          continue;
         }
-
-        // <thought> відкрито, але ще не закрито — продовжуємо буферизувати
-        if (thoughtStart !== -1 && thoughtEnd === -1) {
-          continue;
-        }
-
-        // ─── БАГ 2+3 ВИПРАВЛЕНО: без тегів — відправляємо одразу і чистимо буфер ───
-        // Раніше: continue без відправки (showReasoning=true) або буфер ніколи не очищувався
-        const toSend = res.thoughtBuf;
-        res.thoughtBuf = '';
-        delete delta.reasoning_content;
-        delta.content = toSend;
-        res.write(`data: ${JSON.stringify(parsed)}\n\n`);
-
-      } catch { /* пропускаємо некоректні рядки */ }
+      } catch { /* ignore malformed JSON */ }
     }
   }
 };
