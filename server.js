@@ -7,13 +7,13 @@ const FormData = require('form-data');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Multer: зберігаємо файли в пам'яті (Render free = 512MB RAM, тримай < 20MB)
 const upload = multer({
   storage: multer.memoryStorage(),
-  limits: { fileSize: 25 * 1024 * 1024 }, // 25MB hard limit
+  limits: { fileSize: 25 * 1024 * 1024 },
 });
 
 const NIM_API_BASE = 'https://integrate.api.nvidia.com/v1';
+const GENAI_BASE = 'https://ai.api.nvidia.com/v1/genai';
 const { randomUUID } = require('crypto');
 
 let ADMIN_KEY = process.env.ADMIN_KEY ?? '';
@@ -29,7 +29,6 @@ if (!ADMIN_KEY) {
   console.log('🔑 ADMIN_KEY завантажено з env');
 }
 
-// ─── Живий конфіг ──────────────────────────────────────────────────────────
 const config = {
   showReasoning:      process.env.SHOW_REASONING === 'true',
   enableThinking:     process.env.ENABLE_THINKING === 'true',
@@ -42,7 +41,6 @@ const config = {
   timeoutMs:          parseInt(process.env.TIMEOUT_MS ?? '120000'),
 };
 
-// ─── Статистика ────────────────────────────────────────────────────────────
 const stats = {
   total: 0, success: 0,
   err429: 0, err5xx: 0, errOther: 0,
@@ -54,7 +52,6 @@ function trackEndpoint(name) {
   stats.byEndpoint[name] = (stats.byEndpoint[name] ?? 0) + 1;
 }
 
-// ─── Retry логіка ──────────────────────────────────────────────────────────
 async function fetchWithRetry(axiosConfig) {
   let attempts5xx = 0, attempts429 = 0;
   while (true) {
@@ -82,7 +79,6 @@ async function fetchWithRetry(axiosConfig) {
   }
 }
 
-// ─── Хелпер: витягнути API ключ ────────────────────────────────────────────
 function extractApiKey(req) {
   const authHeader = req.headers['authorization'] ?? '';
   const raw = authHeader.startsWith('Bearer ') ? authHeader.slice(7).trim() : null;
@@ -92,12 +88,10 @@ function extractApiKey(req) {
   return keys[Math.floor(Math.random() * keys.length)];
 }
 
-// ─── Безпечний stringify (захист від циклічних структур axios) ─────────────
 function safeStringify(val) {
   try {
     return JSON.stringify(val);
   } catch {
-    // Циклічна структура — витягуємо тільки рядкові поля
     if (val && typeof val === 'object') {
       const safe = {};
       for (const k of ['message', 'code', 'detail', 'type', 'status']) {
@@ -109,7 +103,6 @@ function safeStringify(val) {
   }
 }
 
-// ─── Хелпер: стандартна обробка помилок ───────────────────────────────────
 function handleError(err, res) {
   const status = err.response?.status ?? 500;
   const rawData = err.response?.data;
@@ -124,19 +117,69 @@ function handleError(err, res) {
   }
 
   if (status !== 429 && status < 500) stats.errOther++;
-
-  // Безпечний лог — не падає на циклічних структурах
   const logData = rawData !== undefined ? safeStringify(rawData) : `"${err.message}"`;
   console.error(`[${status}]`, logData);
-
   if (!res.headersSent) res.status(status).json({ error: { message, code: status } });
 }
 
-// ─── Middleware ─────────────────────────────────────────────────────────────
 app.use(cors());
 app.use(express.json({ limit: '50mb' }));
 
-// ─── ADMIN HTML ─────────────────────────────────────────────────────────────
+// ─── Моделі що використовують genai endpoint ──────────────────────────────
+const GENAI_MODELS = new Set([
+  'black-forest-labs/flux.1-dev',
+  'black-forest-labs/flux.1-schnell',
+  'black-forest-labs/flux.1-canny',
+  'black-forest-labs/flux.1-depth',
+  'black-forest-labs/flux.1-fill',
+  'black-forest-labs/flux.1-redux',
+  'stabilityai/stable-diffusion-xl-base-1.0',
+  'stabilityai/stable-diffusion-3.5-large',
+  'stabilityai/stable-diffusion-3.5-medium',
+  'stabilityai/stable-diffusion-3-medium',
+  'nvidia/sana-1.5-4.8b',
+  'nvidia/sana-1.5-1.6b',
+  'nvidia/sana-1.0-1.6b',
+  'nvidia/cosmos-predict1-7b',
+  'nvidia/cosmos-predict1-14b',
+]);
+
+// Конвертує тіло OpenAI → NVIDIA genai формат
+function toGenaiBody(body) {
+  const out = { prompt: body.prompt };
+  if (body.negative_prompt) out.negative_prompt = body.negative_prompt;
+  out.cfg_scale = body.cfg_scale ?? body.guidance_scale ?? body.scale ?? 3.5;
+  out.steps = body.steps ?? body.num_inference_steps ?? 30;
+  if (body.width)  out.width  = Number(body.width);
+  if (body.height) out.height = Number(body.height);
+  if (body.seed != null && Number(body.seed) >= 0) out.seed = Number(body.seed);
+  return out;
+}
+
+// Нормалізує genai відповідь → OpenAI формат { data: [{ b64_json }] }
+function fromGenaiResponse(data) {
+  if (data?.data) return data; // вже OpenAI формат
+  const artifacts = data?.artifacts ?? [];
+  return {
+    created: Math.floor(Date.now() / 1000),
+    data: artifacts.map(a => ({ b64_json: a.base64 ?? a.b64_json ?? '' })),
+  };
+}
+
+// Конвертує OpenAI поля → integrate формат (num_inference_steps замість steps)
+function toIntegrateBody(body) {
+  const out = { ...body };
+  if (out.steps && !out.num_inference_steps) {
+    out.num_inference_steps = out.steps;
+    delete out.steps;
+  }
+  if (out.scale && !out.guidance_scale) {
+    out.guidance_scale = out.scale;
+    delete out.scale;
+  }
+  return out;
+}
+
 function buildAdminHtml() {
   return `<!DOCTYPE html>
 <html lang="uk">
@@ -177,15 +220,13 @@ function buildAdminHtml() {
     .uptime{font-size:11px;color:#444;text-align:center;margin-bottom:16px}
     .ep-grid{display:grid;grid-template-columns:1fr auto;gap:4px 12px;font-size:13px}
     .ep-name{color:#aaa}.ep-cnt{color:#76b900;text-align:right;font-weight:600}
-    .badge{display:inline-block;background:#22222f;color:#76b900;font-size:10px;padding:2px 6px;border-radius:6px;margin:2px}
     .endpoints-info{background:#12121a;border-radius:10px;padding:12px;margin-top:4px;font-size:12px;color:#666;line-height:1.8}
     code{background:#1e1e2e;padding:1px 5px;border-radius:4px;color:#a0c080;font-size:11px}
   </style>
 </head>
 <body>
   <h1>🚀 NIM Universal Proxy</h1>
-  <p class="sub">Підтримує: chat · embeddings · images · audio · vision · TTS · STT</p>
-
+  <p class="sub">Підтримує: chat · embeddings · images (genai + integrate) · audio · TTS · STT</p>
   <div class="stats" id="statsGrid">
     <div class="stat"><div class="stat-val" id="sTotal">—</div><div class="stat-lbl">Всього запитів</div></div>
     <div class="stat"><div class="stat-val" id="sSuccess">—</div><div class="stat-lbl">Успішних</div></div>
@@ -193,29 +234,25 @@ function buildAdminHtml() {
     <div class="stat err"><div class="stat-val" id="s5xx">—</div><div class="stat-lbl">5xx помилки</div></div>
   </div>
   <div class="uptime" id="uptimeEl"></div>
-
   <div class="card">
     <div class="card-title">📡 Запити по ендпоінтах</div>
     <div class="ep-grid" id="epGrid"><div class="ep-name" style="color:#444">Поки немає даних</div><div></div></div>
   </div>
-
   <div class="card">
     <div class="card-title">🔌 Доступні ендпоінти</div>
     <div class="endpoints-info">
       <code>POST /v1/chat/completions</code> — чат, reasoning, стрімінг<br>
       <code>POST /v1/embeddings</code> — текстові ембединги<br>
-      <code>POST /v1/images/generations</code> — генерація зображень<br>
-      <code>POST /v1/audio/transcriptions</code> — STT (multipart/form-data)<br>
+      <code>POST /v1/images/generations</code> — зображення (auto: genai + integrate)<br>
+      <code>POST /v1/audio/transcriptions</code> — STT<br>
       <code>POST /v1/audio/translations</code> — переклад аудіо<br>
-      <code>POST /v1/audio/speech</code> — TTS (→ аудіо файл)<br>
-      <code>POST /v1/completions</code> — legacy text completion<br>
+      <code>POST /v1/audio/speech</code> — TTS<br>
+      <code>POST /v1/completions</code> — legacy<br>
       <code>GET &nbsp;/v1/models</code> — список моделей<br>
-      <code>ANY &nbsp;/v1/*</code> — будь-який інший NIM ендпоінт (pass-through)
+      <code>ANY &nbsp;/v1/*</code> — pass-through
     </div>
   </div>
-
   ${ADMIN_KEY ? `<div id="keyWrap"><input id="keyInput" type="password" placeholder="🔑 Ключ адміна..."></div>` : ''}
-
   <div class="card">
     <div class="card-title">🧠 Мислення (для chat)</div>
     <div class="row">
@@ -227,50 +264,24 @@ function buildAdminHtml() {
       <label class="toggle"><input type="checkbox" id="showReasoning"><span class="sl"></span></label>
     </div>
   </div>
-
   <div class="card">
     <div class="card-title">🔁 Retry при 429</div>
-    <div class="row">
-      <div><div class="lbl">Кількість спроб</div></div>
-      <input class="num" type="number" id="max429Retries" min="0" max="10">
-    </div>
-    <div class="row">
-      <div><div class="lbl">Пауза (мс)</div></div>
-      <input class="num" type="number" id="retry429DelayMs" min="500" step="500">
-    </div>
+    <div class="row"><div><div class="lbl">Кількість спроб</div></div><input class="num" type="number" id="max429Retries" min="0" max="10"></div>
+    <div class="row"><div><div class="lbl">Пауза (мс)</div></div><input class="num" type="number" id="retry429DelayMs" min="500" step="500"></div>
   </div>
-
   <div class="card">
     <div class="card-title">🔁 Retry при 5xx</div>
-    <div class="row">
-      <div><div class="lbl">Кількість спроб</div></div>
-      <input class="num" type="number" id="maxRetries" min="0" max="5">
-    </div>
-    <div class="row">
-      <div><div class="lbl">Пауза (мс)</div></div>
-      <input class="num" type="number" id="retryDelayMs" min="100" step="100">
-    </div>
+    <div class="row"><div><div class="lbl">Кількість спроб</div></div><input class="num" type="number" id="maxRetries" min="0" max="5"></div>
+    <div class="row"><div><div class="lbl">Пауза (мс)</div></div><input class="num" type="number" id="retryDelayMs" min="100" step="100"></div>
   </div>
-
   <div class="card">
     <div class="card-title">🎛️ Дефолти</div>
-    <div class="row">
-      <div><div class="lbl">Температура</div></div>
-      <input class="num" type="number" id="defaultTemperature" min="0" max="2" step="0.05">
-    </div>
-    <div class="row">
-      <div><div class="lbl">Макс. токени</div></div>
-      <input class="num" type="number" id="defaultMaxTokens" min="256" step="256">
-    </div>
-    <div class="row">
-      <div><div class="lbl">Таймаут (мс)</div></div>
-      <input class="num" type="number" id="timeoutMs" min="10000" step="5000">
-    </div>
+    <div class="row"><div><div class="lbl">Температура</div></div><input class="num" type="number" id="defaultTemperature" min="0" max="2" step="0.05"></div>
+    <div class="row"><div><div class="lbl">Макс. токени</div></div><input class="num" type="number" id="defaultMaxTokens" min="256" step="256"></div>
+    <div class="row"><div><div class="lbl">Таймаут (мс)</div></div><input class="num" type="number" id="timeoutMs" min="10000" step="5000"></div>
   </div>
-
   <button class="btn" onclick="save()">💾 Зберегти</button>
   <div id="status"></div>
-
   <script>
     const $ = id => document.getElementById(id);
     function fmtUptime(ms) {
@@ -283,71 +294,48 @@ function buildAdminHtml() {
     async function loadStats() {
       try {
         const s = await fetch('/admin/stats').then(r=>r.json());
-        $('sTotal').textContent = s.total;
-        $('sSuccess').textContent = s.success;
-        $('s429').textContent = s.err429;
-        $('s5xx').textContent = s.err5xx;
+        $('sTotal').textContent = s.total; $('sSuccess').textContent = s.success;
+        $('s429').textContent = s.err429; $('s5xx').textContent = s.err5xx;
         $('uptimeEl').textContent = 'Аптайм: ' + fmtUptime(s.uptimeMs);
         const ep = s.byEndpoint ?? {};
         const keys = Object.keys(ep);
-        if (keys.length) {
-          $('epGrid').innerHTML = keys.sort((a,b)=>ep[b]-ep[a]).map(k =>
-            \`<div class="ep-name">\${k}</div><div class="ep-cnt">\${ep[k]}</div>\`
-          ).join('');
-        }
+        if (keys.length) $('epGrid').innerHTML = keys.sort((a,b)=>ep[b]-ep[a]).map(k =>
+          \`<div class="ep-name">\${k}</div><div class="ep-cnt">\${ep[k]}</div>\`).join('');
       } catch {}
     }
     async function load() {
       try {
         const c = await fetch('/admin/config').then(r=>r.json());
-        $('enableThinking').checked = c.enableThinking;
-        $('showReasoning').checked = c.showReasoning;
-        $('maxRetries').value = c.maxRetries;
-        $('retryDelayMs').value = c.retryDelayMs;
-        $('max429Retries').value = c.max429Retries;
-        $('retry429DelayMs').value = c.retry429DelayMs;
-        $('defaultTemperature').value = c.defaultTemperature;
-        $('defaultMaxTokens').value = c.defaultMaxTokens;
+        $('enableThinking').checked = c.enableThinking; $('showReasoning').checked = c.showReasoning;
+        $('maxRetries').value = c.maxRetries; $('retryDelayMs').value = c.retryDelayMs;
+        $('max429Retries').value = c.max429Retries; $('retry429DelayMs').value = c.retry429DelayMs;
+        $('defaultTemperature').value = c.defaultTemperature; $('defaultMaxTokens').value = c.defaultMaxTokens;
         $('timeoutMs').value = c.timeoutMs;
       } catch { $('status').innerHTML = '<span class="errt">Не вдалося завантажити</span>'; }
     }
     async function save() {
       const body = {
-        enableThinking: $('enableThinking').checked,
-        showReasoning: $('showReasoning').checked,
-        maxRetries: +$('maxRetries').value,
-        retryDelayMs: +$('retryDelayMs').value,
-        max429Retries: +$('max429Retries').value,
-        retry429DelayMs: +$('retry429DelayMs').value,
-        defaultTemperature: +$('defaultTemperature').value,
-        defaultMaxTokens: +$('defaultMaxTokens').value,
+        enableThinking: $('enableThinking').checked, showReasoning: $('showReasoning').checked,
+        maxRetries: +$('maxRetries').value, retryDelayMs: +$('retryDelayMs').value,
+        max429Retries: +$('max429Retries').value, retry429DelayMs: +$('retry429DelayMs').value,
+        defaultTemperature: +$('defaultTemperature').value, defaultMaxTokens: +$('defaultMaxTokens').value,
         timeoutMs: +$('timeoutMs').value,
       };
       const headers = {'Content-Type':'application/json'};
-      const ki = $('keyInput');
-      if (ki) headers['x-admin-key'] = ki.value;
+      const ki = $('keyInput'); if (ki) headers['x-admin-key'] = ki.value;
       try {
         const r = await fetch('/admin/config', {method:'POST', headers, body: JSON.stringify(body)});
-        if (r.ok) {
-          $('status').innerHTML = '<span class="ok">✓ Збережено</span>';
-          setTimeout(()=>$('status').innerHTML='', 2500);
-        } else {
-          const e = await r.json();
-          $('status').innerHTML = '<span class="errt">'+(e.error||'Помилка')+'</span>';
-        }
+        if (r.ok) { $('status').innerHTML = '<span class="ok">✓ Збережено</span>'; setTimeout(()=>$('status').innerHTML='', 2500); }
+        else { const e = await r.json(); $('status').innerHTML = '<span class="errt">'+(e.error||'Помилка')+'</span>'; }
       } catch { $('status').innerHTML = '<span class="errt">Помилка мережі</span>'; }
     }
-    load(); loadStats();
-    setInterval(loadStats, 10000);
+    load(); loadStats(); setInterval(loadStats, 10000);
   </script>
 </body>
 </html>`;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// ROUTES
-// ═══════════════════════════════════════════════════════════════════════════
-
 app.get('/health', (req, res) => res.json({ status: 'ok', uptime: Date.now() - stats.startTime }));
 app.get('/admin', (req, res) => { res.setHeader('Content-Type', 'text/html'); res.send(buildAdminHtml()); });
 app.get('/admin/config', (req, res) => res.json(config));
@@ -364,21 +352,19 @@ app.post('/admin/config', (req, res) => {
   res.json({ success: true, config });
 });
 
-// ─── GET /v1/models ─────────────────────────────────────────────────────────
+// ─── GET /v1/models ──────────────────────────────────────────────────────────
 app.get('/v1/models', async (req, res) => {
   const apiKey = extractApiKey(req);
   if (!apiKey) return res.status(401).json({ error: { message: 'Відсутній API ключ', code: 401 } });
   trackEndpoint('GET /v1/models');
   try {
     const response = await fetchWithRetry({
-      method: 'get',
-      url: `${NIM_API_BASE}/models`,
+      method: 'get', url: `${NIM_API_BASE}/models`,
       headers: { 'Authorization': `Bearer ${apiKey}` },
       timeout: config.timeoutMs,
     });
     res.json(response.data);
   } catch (err) {
-    // Fallback якщо NIM не підтримує /models
     res.json({ object: 'list', data: [{ id: 'nvidia-nim-proxy', object: 'model', created: Date.now(), owned_by: 'nvidia' }] });
   }
 });
@@ -387,11 +373,9 @@ app.get('/v1/models', async (req, res) => {
 app.post('/v1/chat/completions', async (req, res) => {
   const apiKey = extractApiKey(req);
   if (!apiKey) return res.status(401).json({ error: { message: 'Відсутній API ключ', code: 401 } });
-
   let { model, messages, temperature, max_tokens, stream } = req.body;
   if (!model || !messages) return res.status(400).json({ error: { message: 'model і messages обовязкові', code: 400 } });
 
-  // Санітизація повідомлень (Mistral/JanitorAI сумісність)
   let sanitizedMessages = [];
   let systemContent = '';
   for (const msg of messages) {
@@ -417,8 +401,6 @@ app.post('/v1/chat/completions', async (req, res) => {
     stream: stream ?? false,
     ...(config.enableThinking && { extra_body: { chat_template_kwargs: { thinking: true } } }),
   };
-
-  // Прокидуємо решту полів із req.body (top_p, stop, etc.)
   const knownFields = new Set(['model','messages','temperature','max_tokens','stream']);
   for (const [k, v] of Object.entries(req.body)) {
     if (!knownFields.has(k)) nimBody[k] = v;
@@ -426,21 +408,16 @@ app.post('/v1/chat/completions', async (req, res) => {
 
   try {
     const response = await fetchWithRetry({
-      method: 'post',
-      url: `${NIM_API_BASE}/chat/completions`,
-      data: nimBody,
+      method: 'post', url: `${NIM_API_BASE}/chat/completions`, data: nimBody,
       headers: { 'Authorization': `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
       responseType: stream ? 'stream' : 'json',
       timeout: config.timeoutMs,
     });
-
     stats.success++;
-
     if (stream) {
       res.setHeader('Content-Type', 'text/event-stream');
       res.setHeader('Cache-Control', 'no-cache');
       res.setHeader('Connection', 'keep-alive');
-
       let buffer = '', inReasoning = false;
       response.data.on('data', chunk => {
         buffer += chunk.toString();
@@ -489,19 +466,14 @@ app.post('/v1/chat/completions', async (req, res) => {
   } catch (err) { handleError(err, res); }
 });
 
-// ─── POST /v1/completions (legacy) ──────────────────────────────────────────
+// ─── POST /v1/completions ────────────────────────────────────────────────────
 app.post('/v1/completions', async (req, res) => {
   const apiKey = extractApiKey(req);
   if (!apiKey) return res.status(401).json({ error: { message: 'Відсутній API ключ', code: 401 } });
-
-  stats.total++;
-  trackEndpoint('POST /v1/completions');
-
+  stats.total++; trackEndpoint('POST /v1/completions');
   try {
     const response = await fetchWithRetry({
-      method: 'post',
-      url: `${NIM_API_BASE}/completions`,
-      data: req.body,
+      method: 'post', url: `${NIM_API_BASE}/completions`, data: req.body,
       headers: { 'Authorization': `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
       responseType: req.body.stream ? 'stream' : 'json',
       timeout: config.timeoutMs,
@@ -511,9 +483,7 @@ app.post('/v1/completions', async (req, res) => {
       res.setHeader('Content-Type', 'text/event-stream');
       res.setHeader('Cache-Control', 'no-cache');
       response.data.pipe(res);
-    } else {
-      res.json(response.data);
-    }
+    } else { res.json(response.data); }
   } catch (err) { handleError(err, res); }
 });
 
@@ -523,129 +493,139 @@ app.post('/v1/embeddings', async (req, res) => {
   if (!apiKey) return res.status(401).json({ error: { message: 'Відсутній API ключ', code: 401 } });
   if (!req.body.model || req.body.input === undefined)
     return res.status(400).json({ error: { message: 'model і input обовязкові', code: 400 } });
-
-  stats.total++;
-  trackEndpoint('POST /v1/embeddings');
-
+  stats.total++; trackEndpoint('POST /v1/embeddings');
   try {
     const response = await fetchWithRetry({
-      method: 'post',
-      url: `${NIM_API_BASE}/embeddings`,
-      data: req.body,
+      method: 'post', url: `${NIM_API_BASE}/embeddings`, data: req.body,
       headers: { 'Authorization': `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
       timeout: config.timeoutMs,
     });
-    stats.success++;
-    res.json(response.data);
+    stats.success++; res.json(response.data);
   } catch (err) { handleError(err, res); }
 });
 
 // ─── POST /v1/images/generations ─────────────────────────────────────────────
+// Універсальний: GENAI_MODELS → ai.api.nvidia.com/v1/genai/<model>
+//                інші         → integrate.api.nvidia.com/v1/images/generations
+// З автоматичним fallback на другий endpoint при 400/404/422/405.
 app.post('/v1/images/generations', async (req, res) => {
   const apiKey = extractApiKey(req);
   if (!apiKey) return res.status(401).json({ error: { message: 'Відсутній API ключ', code: 401 } });
   if (!req.body.model || !req.body.prompt)
     return res.status(400).json({ error: { message: 'model і prompt обовязкові', code: 400 } });
 
-  stats.total++;
-  trackEndpoint('POST /v1/images/generations');
+  const model = String(req.body.model).trim();
+  stats.total++; trackEndpoint('POST /v1/images/generations');
 
-  try {
-    const response = await fetchWithRetry({
-      method: 'post',
-      url: `${NIM_API_BASE}/images/generations`,
-      data: req.body,
+  const isGenaiModel = GENAI_MODELS.has(model);
+
+  async function tryGenai() {
+    const url = `${GENAI_BASE}/${model}`;
+    const body = toGenaiBody(req.body);
+    console.log(`[img] genai → ${url}`, JSON.stringify(body).slice(0, 100));
+    const r = await fetchWithRetry({
+      method: 'post', url, data: body,
+      headers: { 'Authorization': `Bearer ${apiKey}`, 'Content-Type': 'application/json', 'Accept': 'application/json' },
+      timeout: config.timeoutMs,
+    });
+    return fromGenaiResponse(r.data);
+  }
+
+  async function tryIntegrate() {
+    const url = `${NIM_API_BASE}/images/generations`;
+    const body = toIntegrateBody(req.body);
+    console.log(`[img] integrate → ${url}`, JSON.stringify(body).slice(0, 100));
+    const r = await fetchWithRetry({
+      method: 'post', url, data: body,
       headers: { 'Authorization': `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
       timeout: config.timeoutMs,
     });
+    return r.data;
+  }
+
+  const fallbackStatuses = new Set([400, 404, 405, 422]);
+
+  try {
+    let result;
+    if (isGenaiModel) {
+      try { result = await tryGenai(); }
+      catch (e) {
+        if (fallbackStatuses.has(e.response?.status)) {
+          console.warn(`[img] genai→${e.response.status}, fallback integrate`);
+          result = await tryIntegrate();
+        } else throw e;
+      }
+    } else {
+      try { result = await tryIntegrate(); }
+      catch (e) {
+        if (fallbackStatuses.has(e.response?.status)) {
+          console.warn(`[img] integrate→${e.response.status}, fallback genai`);
+          result = await tryGenai();
+        } else throw e;
+      }
+    }
     stats.success++;
-    res.json(response.data);
+    res.json(result);
   } catch (err) { handleError(err, res); }
 });
 
-// ─── POST /v1/audio/transcriptions (STT) ─────────────────────────────────────
-// Приймає multipart/form-data з полем "file"
+// ─── POST /v1/audio/transcriptions ──────────────────────────────────────────
 app.post('/v1/audio/transcriptions', upload.single('file'), async (req, res) => {
   const apiKey = extractApiKey(req);
   if (!apiKey) return res.status(401).json({ error: { message: 'Відсутній API ключ', code: 401 } });
-  if (!req.file) return res.status(400).json({ error: { message: 'Файл аудіо обовязковий (поле "file")', code: 400 } });
+  if (!req.file) return res.status(400).json({ error: { message: 'Файл аудіо обовязковий', code: 400 } });
   if (!req.body.model) return res.status(400).json({ error: { message: 'model обовязкова', code: 400 } });
-
-  stats.total++;
-  trackEndpoint('POST /v1/audio/transcriptions');
-
+  stats.total++; trackEndpoint('POST /v1/audio/transcriptions');
   const form = new FormData();
-  form.append('file', req.file.buffer, {
-    filename: req.file.originalname || 'audio.wav',
-    contentType: req.file.mimetype,
-  });
+  form.append('file', req.file.buffer, { filename: req.file.originalname || 'audio.wav', contentType: req.file.mimetype });
   form.append('model', req.body.model);
   if (req.body.language) form.append('language', req.body.language);
   if (req.body.response_format) form.append('response_format', req.body.response_format);
   if (req.body.temperature) form.append('temperature', req.body.temperature);
-
   try {
     const response = await fetchWithRetry({
-      method: 'post',
-      url: `${NIM_API_BASE}/audio/transcriptions`,
-      data: form,
+      method: 'post', url: `${NIM_API_BASE}/audio/transcriptions`, data: form,
       headers: { 'Authorization': `Bearer ${apiKey}`, ...form.getHeaders() },
       timeout: config.timeoutMs,
     });
-    stats.success++;
-    res.json(response.data);
+    stats.success++; res.json(response.data);
   } catch (err) { handleError(err, res); }
 });
 
-// ─── POST /v1/audio/translations ─────────────────────────────────────────────
+// ─── POST /v1/audio/translations ────────────────────────────────────────────
 app.post('/v1/audio/translations', upload.single('file'), async (req, res) => {
   const apiKey = extractApiKey(req);
   if (!apiKey) return res.status(401).json({ error: { message: 'Відсутній API ключ', code: 401 } });
   if (!req.file) return res.status(400).json({ error: { message: 'Файл аудіо обовязковий', code: 400 } });
-
-  stats.total++;
-  trackEndpoint('POST /v1/audio/translations');
-
+  stats.total++; trackEndpoint('POST /v1/audio/translations');
   const form = new FormData();
   form.append('file', req.file.buffer, { filename: req.file.originalname || 'audio.wav', contentType: req.file.mimetype });
   if (req.body.model) form.append('model', req.body.model);
   if (req.body.response_format) form.append('response_format', req.body.response_format);
-
   try {
     const response = await fetchWithRetry({
-      method: 'post',
-      url: `${NIM_API_BASE}/audio/translations`,
-      data: form,
+      method: 'post', url: `${NIM_API_BASE}/audio/translations`, data: form,
       headers: { 'Authorization': `Bearer ${apiKey}`, ...form.getHeaders() },
       timeout: config.timeoutMs,
     });
-    stats.success++;
-    res.json(response.data);
+    stats.success++; res.json(response.data);
   } catch (err) { handleError(err, res); }
 });
 
-// ─── POST /v1/audio/speech (TTS) ─────────────────────────────────────────────
-// Повертає аудіо файл (binary stream)
+// ─── POST /v1/audio/speech ───────────────────────────────────────────────────
 app.post('/v1/audio/speech', async (req, res) => {
   const apiKey = extractApiKey(req);
   if (!apiKey) return res.status(401).json({ error: { message: 'Відсутній API ключ', code: 401 } });
   if (!req.body.model || !req.body.input)
     return res.status(400).json({ error: { message: 'model і input обовязкові', code: 400 } });
-
-  stats.total++;
-  trackEndpoint('POST /v1/audio/speech');
-
+  stats.total++; trackEndpoint('POST /v1/audio/speech');
   try {
     const response = await fetchWithRetry({
-      method: 'post',
-      url: `${NIM_API_BASE}/audio/speech`,
-      data: req.body,
+      method: 'post', url: `${NIM_API_BASE}/audio/speech`, data: req.body,
       headers: { 'Authorization': `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
-      responseType: 'stream',
-      timeout: config.timeoutMs,
+      responseType: 'stream', timeout: config.timeoutMs,
     });
     stats.success++;
-    // Прокидуємо Content-Type від NIM (mp3, wav, opus, etc.)
     const ct = response.headers['content-type'] ?? 'audio/mpeg';
     res.setHeader('Content-Type', ct);
     if (response.headers['content-disposition'])
@@ -654,43 +634,31 @@ app.post('/v1/audio/speech', async (req, res) => {
   } catch (err) { handleError(err, res); }
 });
 
-// ─── UNIVERSAL PASS-THROUGH для /v1/* ────────────────────────────────────────
-// Це покриє Drug Discovery, Object Detection, OCR, Digital Twin, і все інше
-// що має JSON тіло або query params. Файли НЕ підтримуються тут — тільки JSON.
+// ─── UNIVERSAL PASS-THROUGH /v1/* ───────────────────────────────────────────
 app.all('/v1/*', async (req, res) => {
   const apiKey = extractApiKey(req);
   if (!apiKey) return res.status(401).json({ error: { message: 'Відсутній API ключ', code: 401 } });
-
-  const nimPath = req.path; // вже /v1/...
+  const nimPath = req.path;
   const isStream = req.body?.stream === true;
   const endpoint = `${req.method} ${nimPath}`;
-
-  stats.total++;
-  trackEndpoint(endpoint);
+  stats.total++; trackEndpoint(endpoint);
   console.log(`[pass-through] ${endpoint}`);
-
   try {
     const response = await fetchWithRetry({
       method: req.method.toLowerCase(),
       url: `${NIM_API_BASE}${nimPath}`,
       data: ['GET', 'HEAD'].includes(req.method) ? undefined : req.body,
       params: req.query,
-      headers: {
-        'Authorization': `Bearer ${apiKey}`,
-        'Content-Type': 'application/json',
-      },
+      headers: { 'Authorization': `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
       responseType: isStream ? 'stream' : 'json',
       timeout: config.timeoutMs,
     });
-
     stats.success++;
-
     if (isStream) {
       res.setHeader('Content-Type', response.headers['content-type'] ?? 'text/event-stream');
       res.setHeader('Cache-Control', 'no-cache');
       response.data.pipe(res);
     } else {
-      // Копіюємо важливі заголовки відповіді
       const ct = response.headers['content-type'];
       if (ct) res.setHeader('Content-Type', ct);
       res.status(response.status).json(response.data);
@@ -698,12 +666,10 @@ app.all('/v1/*', async (req, res) => {
   } catch (err) { handleError(err, res); }
 });
 
-// ─── 404 ─────────────────────────────────────────────────────────────────────
 app.all('*', (req, res) => res.status(404).json({
   error: { message: `Ендпоінт ${req.path} не знайдено. Всі NIM ендпоінти доступні через /v1/*` }
 }));
 
-// ─── Graceful shutdown ────────────────────────────────────────────────────────
 process.on('SIGTERM', () => {
   console.log('SIGTERM отримано, завершую...');
   setTimeout(() => process.exit(0), 3000);
