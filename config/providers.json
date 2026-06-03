@@ -6,8 +6,6 @@
   "google": {
     "type": "openai",
     "baseUrl": "https://generativelanguage.googleapis.com/v1beta/openai"
-  }
-
   },
   "groq": {
     "type": "openai",
