@@ -18,16 +18,14 @@ function cleanResponse(data, config) {
       delete choice.message.vertex_ai_url_context_metadata;
       delete choice.message.vertex_ai_safety_results;
       delete choice.message.vertex_ai_citation_metadata;
-      
+
       if (config?.showReasoning) {
-        // Якщо в content є <thought> — витягуємо в reasoning_content
         const { thought, content } = extractThoughtTags(choice.message.content || '');
         if (thought) {
           choice.message.reasoning_content = thought;
           choice.message.content = content;
         }
       } else {
-        // Видаляємо reasoning_content і <thought> теги з content
         delete choice.message.reasoning_content;
         if (choice.message.content) {
           const { content } = extractThoughtTags(choice.message.content);
@@ -54,19 +52,15 @@ module.exports = {
         const parsed = JSON.parse(t.slice(6));
         const delta = parsed.choices?.[0]?.delta;
         if (delta) {
-          const rc = delta.reasoning_content, c = delta.content;
-          if (config.showReasoning) {
-            let out = '';
-            if (rc && !res.inReasoning) { out = '<think>\n' + rc; res.inReasoning = true; }
-            else if (rc) out = rc;
-            if (c && res.inReasoning) { out += '\n</think>\n\n' + c; res.inReasoning = false; }
-            else if (c) out += c;
-            delta.content = out || '';
-          } else {
+          const rc = delta.reasoning_content;
+          const c = delta.content;
+
+          if (!config.showReasoning) {
+            delete delta.reasoning_content;
             if (rc && !c) continue;
             delta.content = c ?? '';
           }
-          delete delta.reasoning_content;
+          delete delta.extra_content;
         }
         res.write(`data: ${JSON.stringify(parsed)}\n\n`);
       } catch {}
