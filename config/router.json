@@ -1,0 +1,17 @@
+{
+  "aliases": {
+    "deepseek": [
+      "nvidia/deepseek-ai/deepseek-v4-pro",
+      "groq/deepseek-r1-distill-llama-70b-specdec",
+      "fast-fallback"
+    ],
+    "fast-fallback": [
+      "google/gemini-1.5-flash",
+      "nvidia/meta/llama-3.1-8b-instruct"
+    ],
+    "claude-coder": [
+      "google/gemini-1.5-pro",
+      "nvidia/deepseek-ai/deepseek-v4-pro"
+    ]
+  }
+}

@@ -1,0 +1,14 @@
+{
+  "nvidia": {
+    "type": "openai",
+    "baseUrl": "https://integrate.api.nvidia.com/v1"
+  },
+  "google": {
+    "type": "gemini",
+    "baseUrl": "https://generativelanguage.googleapis.com/v1beta/models"
+  },
+  "groq": {
+    "type": "openai",
+    "baseUrl": "https://api.groq.com/openai/v1"
+  }
+}
