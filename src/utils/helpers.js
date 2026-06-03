@@ -2,7 +2,7 @@ const axios = require('axios');
 
 const config = {
   showReasoning:      process.env.SHOW_REASONING !== 'false',
-  enableThinking:     process.env.ENABLE_THINKING !== 'false',
+  enableThinking:     process.env.ENABLE_THINKING === 'true',
   maxRetries:         parseInt(process.env.MAX_RETRIES ?? '2'),
   retryDelayMs:       parseInt(process.env.RETRY_DELAY_MS ?? '1000'),
   max429Retries:      parseInt(process.env.MAX_429_RETRIES ?? '3'),
