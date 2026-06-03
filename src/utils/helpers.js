@@ -9,14 +9,16 @@ const config = {
   retry429DelayMs:    parseInt(process.env.RETRY_429_DELAY_MS ?? '5000'),
   defaultTemperature: parseFloat(process.env.DEFAULT_TEMPERATURE ?? '0.6'),
   defaultMaxTokens:   parseInt(process.env.DEFAULT_MAX_TOKENS ?? '2048'),
-  timeoutMs:          parseInt(process.env.TIMEOUT_MS ?? '120000'),
+  // Render free tier обриває з'єднання через ~90с. Ставимо 85с щоб
+  // axios встиг сам завершити і повернути нормальну помилку клієнту.
+  timeoutMs:          parseInt(process.env.TIMEOUT_MS ?? '85000'),
 };
 
 const stats = {
   total: 0, success: 0,
   err429: 0, err5xx: 0, errOther: 0,
   byEndpoint: {},
-  byProvider: {}, // Новий лічильник для провайдерів
+  byProvider: {},
   startTime: Date.now(),
 };
 
@@ -66,7 +68,6 @@ function extractApiKey(req, providerName = 'nvidia') {
 
   const keys = raw.split(',').map(k => k.trim()).filter(Boolean);
   
-  // Якщо передано кілька ключів — вибираємо за індексом провайдера
   if (keys.length > 1) {
     const idx = PROVIDER_ORDER.indexOf(providerName);
     return keys[idx % keys.length];

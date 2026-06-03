@@ -52,16 +52,16 @@ module.exports = {
 
       if (!t.startsWith('data: ')) continue;
 
-      try {
-        const parsed = JSON.parse(t.slice(6));
-        const delta = parsed.choices?.[0]?.delta;
+        try {
+          const parsed = JSON.parse(t.slice(6));
+          const delta = parsed.choices?.[0]?.delta;
 
-        if (!delta || delta.content == null) {
+          if (!delta || delta.content == null) {
           res.write(`data: ${JSON.stringify(parsed)}\n\n`);
           continue;
         }
 
-        let content = delta.content;
+        let content = String(delta.content || '');
         
         // State Machine для миттєвого стрімінгу без затримок
         if (res.isThinking === undefined) res.isThinking = false;
@@ -72,12 +72,14 @@ module.exports = {
             if (startIdx === -1) {
               // Звичайний текст, відправляємо одразу
               res.write(`data: ${JSON.stringify({ choices: [{ delta: { content: content, role: 'assistant' }, index: 0 }] })}\n\n`);
+              if (res.flush) res.flush();
               content = '';
             } else {
               // Відправляємо текст ДО тегу, перемикаємось в режим reasoning
               const before = content.slice(0, startIdx);
               if (before) {
                 res.write(`data: ${JSON.stringify({ choices: [{ delta: { content: before, role: 'assistant' }, index: 0 }] })}\n\n`);
+                if (res.flush) res.flush();
               }
               content = content.slice(startIdx + '<thought>'.length);
               res.isThinking = true;
@@ -88,6 +90,7 @@ module.exports = {
               // Ми все ще в блоці думок, стрімимо як reasoning_content
               if (config.showReasoning) {
                 res.write(`data: ${JSON.stringify({ choices: [{ delta: { reasoning_content: content, role: 'assistant' }, index: 0 }] })}\n\n`);
+                if (res.flush) res.flush();
               }
               content = '';
             } else {
@@ -95,6 +98,7 @@ module.exports = {
               const thought = content.slice(0, endIdx);
               if (config.showReasoning && thought) {
                 res.write(`data: ${JSON.stringify({ choices: [{ delta: { reasoning_content: thought, role: 'assistant' }, index: 0 }] })}\n\n`);
+                if (res.flush) res.flush();
               }
               content = content.slice(endIdx + '</thought>'.length);
               res.isThinking = false;
