@@ -1,10 +1,10 @@
 function extractThoughtTags(text) {
   const match = text.match(/^<thought>[\s\S]*?<\/thought>/);
   if (!match) return { thought: null, content: text };
-  return {
-    thought: match[0].replace(/<\/?thought>/g, '').trim(),
-    content: text.slice(match[0].length).trim()
-  };
+  const thought = match[0].replace(/<\/?thought>/g, '').trim();
+  const content = text.slice(match[0].length).trim();
+  // Якщо після </thought> нічого немає — думки є і відповіддю
+  return { thought, content: content || thought };
 }
 
 function cleanResponse(data, config) {
