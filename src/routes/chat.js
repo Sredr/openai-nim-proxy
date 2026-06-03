@@ -4,13 +4,12 @@ const router = express.Router();
 const providersConfig = require('../../config/providers.json');
 const routerConfig = require('../../config/router.json');
 const adapters = require('../adapters');
-const { extractApiKey, handleError, trackEndpoint, stats, config } = require('../utils/helpers');
+const { extractApiKey, handleError, trackEndpoint, trackProvider, stats, config } = require('../utils/helpers');
 
 function resolveModelChain(modelName, visited = new Set()) {
   if (visited.has(modelName)) return [];
   visited.add(modelName);
   
-  // Якщо в router.json є такий аліас (напр. "deepseek"), розгортаємо ланцюжок
   const chain = routerConfig.aliases?.[modelName];
   if (chain) {
     let resolvedChain = [];
@@ -18,7 +17,6 @@ function resolveModelChain(modelName, visited = new Set()) {
     return resolvedChain;
   }
   
-  // Якщо аліасу немає, повертаємо саму модель як єдиний елемент ланцюжка
   return [modelName];
 }
 
@@ -28,7 +26,6 @@ router.post('/completions', async (req, res) => {
   const requestedAlias = req.body.model || 'default';
   const modelChain = resolveModelChain(requestedAlias);
 
-  // Санітизація повідомлень (твоя оригінальна логіка)
   let sanitizedMessages = [];
   let systemContent = '';
   for (const msg of req.body.messages || []) {
@@ -52,7 +49,6 @@ router.post('/completions', async (req, res) => {
       let providerName = 'nvidia'; 
       let pureModelName = actualModelPath;
 
-      // Автоматично розбиваємо "google/gemma-4-31b-it" -> провайдер: google, модель: gemma-4-31b-it
       if (actualModelPath.includes('/')) {
         const parts = actualModelPath.split('/');
         providerName = parts[0].toLowerCase();
@@ -60,14 +56,15 @@ router.post('/completions', async (req, res) => {
       }
 
       const provider = providersConfig[providerName] || { type: 'openai', baseUrl: 'https://integrate.api.nvidia.com/v1' };
-      
-      // Дістаємо ключ (він успішно візьметься з твого Bearer токена)
       const apiKey = extractApiKey(req, providerName);
 
       if (!apiKey) { 
         console.warn(`[Router] ⚠️ Не знайдено API ключ для провайдера: ${providerName}. Пропускаю модель ${pureModelName}`); 
         continue; 
       }
+      
+      // Фіксуємо використання цього провайдера
+      trackProvider(providerName);
       
       console.log(`[Router] ➡️ Направляю на: ${providerName} | Чиста модель: ${pureModelName}`);
 
