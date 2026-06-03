@@ -54,6 +54,8 @@ async function fetchWithRetry(axiosConfig) {
   }
 }
 
+const PROVIDER_ORDER = ['nvidia', 'google', 'groq'];
+
 function extractApiKey(req, providerName = 'nvidia') {
   const envKey = process.env[`${providerName.toUpperCase()}_API_KEY`];
   if (envKey) return envKey;
@@ -63,7 +65,14 @@ function extractApiKey(req, providerName = 'nvidia') {
   if (!raw) return null;
 
   const keys = raw.split(',').map(k => k.trim()).filter(Boolean);
-  return keys.length ? keys[Math.floor(Math.random() * keys.length)] : null;
+  
+  // Якщо передано кілька ключів — вибираємо за індексом провайдера
+  if (keys.length > 1) {
+    const idx = PROVIDER_ORDER.indexOf(providerName);
+    return keys[idx % keys.length];
+  }
+  
+  return keys[0];
 }
 
 function safeStringify(val) {
