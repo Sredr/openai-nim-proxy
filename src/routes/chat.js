@@ -49,15 +49,19 @@ router.post('/completions', async (req, res) => {
       let providerName = 'nvidia'; 
       let pureModelName = actualModelPath;
 
-      // Розумний розбір префіксів
+      // ─── ТОЧНИЙ І НАДІЙНИЙ РОЗБІР ПРОВАЙДЕРІВ ───
       if (actualModelPath.includes('/')) {
         const parts = actualModelPath.split('/');
-        const possibleProvider = parts[0].toLowerCase();
+        const firstPart = parts[0].toLowerCase();
         
-        if (providersConfig[possibleProvider]) {
-          providerName = possibleProvider;
+        // Перевіряємо, чи перше слово є зареєстрованим провайдером (напр. "nvidia" або "google")
+        if (providersConfig[firstPart]) {
+          providerName = firstPart;
+          // Відрізаємо ТІЛЬКИ префікс провайдера, зберігаючи решту шляху (напр. "mistralai/mistral-large...")
           pureModelName = parts.slice(1).join('/'); 
         } else {
+          // Якщо першого слова немає в провайдерах (напр. запит типу "mistralai/mistral-large..."), 
+          // то за замовчуванням шлемо на nvidia, залишаючи всю назву моделі цілою
           providerName = 'nvidia';
           pureModelName = actualModelPath;
         }
@@ -72,9 +76,8 @@ router.post('/completions', async (req, res) => {
       }
       
       trackProvider(providerName);
-      console.log(`[Router] ➡️ Направляю на: ${providerName} | Чиста модель: ${pureModelName}`);
+      console.log(`[Router] ➡️ Направляю на: ${providerName} | Модель для API: ${pureModelName}`);
 
-      // Будуємо тіло запиту
       const nimBody = {
         ...req.body,
         model: pureModelName
@@ -134,6 +137,12 @@ router.post('/completions', async (req, res) => {
               }
               res.write(`data: ${JSON.stringify(data)}\n\n`);
             } catch {}
+          }
+        });
+        
+        res.on('close', () => {
+          if (response.data && typeof response.data.destroy === 'function') {
+            response.data.destroy();
           }
         });
         
