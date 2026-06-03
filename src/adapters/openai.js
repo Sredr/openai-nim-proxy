@@ -1,6 +1,23 @@
+function cleanResponse(data, config) {
+  if (!data?.choices) return data;
+  for (const choice of data.choices) {
+    if (choice.message) {
+      // Видаляємо специфічні поля Google (extra_content, thought_signature тощо)
+      delete choice.message.extra_content;
+      // Якщо showReasoning вимкнено — прибираємо reasoning_content
+      if (!config?.showReasoning) {
+        delete choice.message.reasoning_content;
+      }
+    }
+  }
+  // Також на верхньому рівні буває
+  delete data.extra_content;
+  return data;
+}
+
 module.exports = {
   formatReq: (body, model) => ({ ...body, model }),
-  formatRes: (data) => data,
+  formatRes: (data, config) => cleanResponse(data, config),
   parseStream: (data, res, config) => {
     const lines = data.toString().split('\n');
     for (const line of lines) {

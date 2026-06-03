@@ -111,7 +111,7 @@ router.post('/chat/completions', async (req, res) => {
         response.data.on('end', () => res.end());
         response.data.on('error', () => res.end());
       } else {
-        const finalData = adapter.formatRes(response.data);
+        const finalData = adapter.formatRes(response.data, config);
         if (provider.type === 'openai') {
           for (const choice of finalData.choices ?? []) {
             if (choice.message?.reasoning_content && config.showReasoning) {
