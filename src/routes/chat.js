@@ -26,6 +26,7 @@ router.post('/completions', async (req, res) => {
   const requestedAlias = req.body.model || 'default';
   const modelChain = resolveModelChain(requestedAlias);
 
+  // Санітизація повідомлень (твоя оригінальна логіка)
   let sanitizedMessages = [];
   let systemContent = '';
   for (const msg of req.body.messages || []) {
@@ -49,13 +50,22 @@ router.post('/completions', async (req, res) => {
       let providerName = 'nvidia'; 
       let pureModelName = actualModelPath;
 
+      // Розумний розбір префіксів: відрізаємо тільки якщо це відомий провайдер (напр. google)
       if (actualModelPath.includes('/')) {
         const parts = actualModelPath.split('/');
-        providerName = parts[0].toLowerCase();
-        pureModelName = parts.slice(1).join('/');
+        const possibleProvider = parts[0].toLowerCase();
+        
+        if (providersConfig[possibleProvider]) {
+          providerName = possibleProvider;
+          pureModelName = parts.slice(1).join('/'); // Відрізаємо префікс (напр. "google/gemma..." -> "gemma...")
+        } else {
+          // Якщо перша частина — це розробник моделі (meta, mistralai), залишаємо назву цілою для NVIDIA
+          providerName = 'nvidia';
+          pureModelName = actualModelPath;
+        }
       }
 
-      const provider = providersConfig[providerName] || { type: 'openai', baseUrl: 'https://integrate.api.nvidia.com/v1' };
+      const provider = providersConfig[providerName] || providersConfig['nvidia'];
       const apiKey = extractApiKey(req, providerName);
 
       if (!apiKey) { 
@@ -63,7 +73,7 @@ router.post('/completions', async (req, res) => {
         continue; 
       }
       
-      // Фіксуємо використання цього провайдера
+      // Фіксуємо використання цього провайдера в статистиці
       trackProvider(providerName);
       
       console.log(`[Router] ➡️ Направляю на: ${providerName} | Чиста модель: ${pureModelName}`);
