@@ -27,7 +27,7 @@ app.all('/v1/*', async (req, res) => {
   const apiKey = extractApiKey(req);
   if (!apiKey) return res.status(401).json({ error: { message: 'Відсутній API ключ', code: 401 } });
   
-  const nimPath = req.path;
+  const nimPath = req.path.replace(/^\/v1/, '');
   const isStream = req.body?.stream === true;
   stats.total++; trackEndpoint(`${req.method} ${nimPath}`);
   

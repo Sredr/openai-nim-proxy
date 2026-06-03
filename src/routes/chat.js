@@ -20,7 +20,7 @@ function resolveModelChain(modelName, visited = new Set()) {
   return [modelName];
 }
 
-router.post('/completions', async (req, res) => {
+router.post('/chat/completions', async (req, res) => {
   stats.total++; trackEndpoint('POST /v1/chat/completions');
   
   const requestedAlias = req.body.model || 'default';
