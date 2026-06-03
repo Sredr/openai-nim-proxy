@@ -3,7 +3,6 @@ const axios = require('axios');
 const router = express.Router();
 const providersConfig = require('../../config/providers.json');
 const routerConfig = require('../../config/router.json');
-const adapters = require('../adapters');
 const { extractApiKey, handleError, trackEndpoint, trackProvider, stats, config } = require('../utils/helpers');
 
 function resolveModelChain(modelName, visited = new Set()) {
@@ -50,16 +49,15 @@ router.post('/completions', async (req, res) => {
       let providerName = 'nvidia'; 
       let pureModelName = actualModelPath;
 
-      // Розумний розбір префіксів: відрізаємо тільки якщо це відомий провайдер (напр. google)
+      // Розумний розбір префіксів
       if (actualModelPath.includes('/')) {
         const parts = actualModelPath.split('/');
         const possibleProvider = parts[0].toLowerCase();
         
         if (providersConfig[possibleProvider]) {
           providerName = possibleProvider;
-          pureModelName = parts.slice(1).join('/'); // Відрізаємо префікс (напр. "google/gemma-4-31b-it" -> "gemma-4-31b-it")
+          pureModelName = parts.slice(1).join('/'); 
         } else {
-          // Якщо перша частина — це розробник моделі (meta, mistralai), залишаємо назву цілою для NVIDIA
           providerName = 'nvidia';
           pureModelName = actualModelPath;
         }
@@ -73,16 +71,15 @@ router.post('/completions', async (req, res) => {
         continue; 
       }
       
-      // Фіксуємо використання цього провайдера в статистиці
       trackProvider(providerName);
-      
       console.log(`[Router] ➡️ Направляю на: ${providerName} | Чиста модель: ${pureModelName}`);
 
-      // Завжди використовуємо OpenAI адаптер, якщо тип провайдера openai (включаючи новий API Google)
-      const adapter = adapters[provider.type] || adapters.openai;
-      const requestBody = adapter.formatReq(req.body, pureModelName);
+      // Будуємо тіло запиту
+      const nimBody = {
+        ...req.body,
+        model: pureModelName
+      };
 
-      // Формуємо URL та заголовки суворо за стандартом OpenAI
       const reqUrl = `${provider.baseUrl}/chat/completions`;
       const headers = { 
         'Content-Type': 'application/json',
@@ -92,7 +89,7 @@ router.post('/completions', async (req, res) => {
       const response = await axios({
         method: 'post', 
         url: reqUrl, 
-        data: requestBody, 
+        data: nimBody, 
         headers,
         responseType: req.body.stream ? 'stream' : 'json', 
         timeout: config.timeoutMs,
@@ -104,21 +101,54 @@ router.post('/completions', async (req, res) => {
         res.setHeader('Content-Type', 'text/event-stream');
         res.setHeader('Cache-Control', 'no-cache');
         res.setHeader('Connection', 'keep-alive');
-        res.inReasoning = false;
-        response.data.on('data', chunk => adapter.parseStream(chunk, res, config));
+        
+        let buffer = '', inReasoning = false;
+        
+        response.data.on('data', chunk => {
+          buffer += chunk.toString();
+          const lines = buffer.split('\n');
+          buffer = lines.pop() ?? '';
+          
+          for (const line of lines) {
+            const t = line.trim();
+            if (!t) continue;
+            if (t === 'data: [DONE]') { res.write('data: [DONE]\n\n'); continue; }
+            if (!t.startsWith('data: ')) continue;
+            try {
+              const data = JSON.parse(t.slice(6));
+              const delta = data.choices?.[0]?.delta;
+              if (delta) {
+                const rc = delta.reasoning_content, c = delta.content;
+                if (config.showReasoning) {
+                  let out = '';
+                  if (rc && !inReasoning) { out = '<think>\n' + rc; inReasoning = true; }
+                  else if (rc) out = rc;
+                  if (c && inReasoning) { out += '\n</think>\n\n' + c; inReasoning = false; }
+                  else if (c) out += c;
+                  delta.content = out || '';
+                } else {
+                  if (rc && !c) continue;
+                  delta.content = c ?? '';
+                }
+                delete delta.reasoning_content;
+              }
+              res.write(`data: ${JSON.stringify(data)}\n\n`);
+            } catch {}
+          }
+        });
+        
         response.data.on('end', () => res.end());
         response.data.on('error', () => res.end());
       } else {
-        const finalData = adapter.formatRes(response.data);
-        if (provider.type === 'openai') {
-          for (const choice of finalData.choices ?? []) {
-            if (choice.message?.reasoning_content && config.showReasoning) {
-              choice.message.content = `<think>\n${choice.message.reasoning_content}\n</think>\n\n${choice.message.content ?? ''}`;
-              delete choice.message.reasoning_content;
-            }
-          }
+        const data = response.data;
+        for (const choice of data.choices ?? []) {
+          const msg = choice.message;
+          if (!msg) continue;
+          if (config.showReasoning && msg.reasoning_content)
+            msg.content = `<think>\n${msg.reasoning_content}\n</think>\n\n${msg.content ?? ''}`;
+          delete msg.reasoning_content;
         }
-        res.json(finalData);
+        res.json(data);
       }
       return; 
     } catch (error) {
