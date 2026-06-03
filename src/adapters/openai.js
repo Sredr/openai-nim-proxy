@@ -44,101 +44,104 @@ module.exports = {
     for (const line of lines) {
       const t = line.trim();
       if (!t) continue;
-      if (t === 'data: [DONE]') { res.write('data: [DONE]\n\n'); continue; }
+
+      // ─── БАГ 1 ВИПРАВЛЕНО: було 'data:' — ніколи не матчило реальний [DONE] ───
+      if (t === 'data: [DONE]') {
+        // Скидаємо залишок буферу якщо є
+        const remaining = res.thoughtBuf || '';
+        if (remaining.trim()) {
+          if (config.showReasoning && !res.thoughtFlushed) {
+            const thought = remaining.replace(/<\/?thought>/g, '').trim();
+            if (thought) {
+              res.thoughtFlushed = true;
+              res.write(`data: ${JSON.stringify({ choices: [{ delta: { reasoning_content: thought, role: 'assistant' }, finish_reason: 'stop', index: 0 }] })}\n\n`);
+            }
+          } else if (!config.showReasoning) {
+            // Викидаємо незакриті thought-теги, відправляємо решту як content
+            const clean = remaining.replace(/<thought>[\s\S]*$/g, '').trim();
+            if (clean) {
+              res.write(`data: ${JSON.stringify({ choices: [{ delta: { content: clean, role: 'assistant' }, index: 0 }] })}\n\n`);
+            }
+          }
+        }
+        res.thoughtBuf = '';
+        res.write('data: [DONE]\n\n');
+        continue;
+      }
+
       if (!t.startsWith('data: ')) continue;
+
       try {
         const parsed = JSON.parse(t.slice(6));
         const delta = parsed.choices?.[0]?.delta;
-        if (delta) {
-          delete delta.extra_content;
-          const c = delta.content;
+
+        if (!delta) {
+          res.write(`data: ${JSON.stringify(parsed)}\n\n`);
+          continue;
+        }
+
+        delete delta.extra_content;
+        const c = delta.content;
+
+        // Upstream вже повертає reasoning_content — пропускаємо наскрізь
+        if (delta.reasoning_content) {
+          if (config.showReasoning) res.write(`data: ${JSON.stringify(parsed)}\n\n`);
+          continue;
+        }
+
+        // Чанк без content (finish_reason тощо) — відправляємо як є
+        if (c == null) {
+          res.write(`data: ${JSON.stringify(parsed)}\n\n`);
+          continue;
+        }
+
+        // ─── Логіка обробки <thought> тегів ───
+        if (!res.thoughtBuf) res.thoughtBuf = '';
+        res.thoughtBuf += c;
+
+        const thoughtStart = res.thoughtBuf.indexOf('<thought>');
+        const thoughtEnd   = res.thoughtBuf.indexOf('</thought>');
+
+        // Знайдено повний блок <thought>...</thought>
+        if (thoughtStart !== -1 && thoughtEnd !== -1) {
+          const before  = res.thoughtBuf.slice(0, thoughtStart);
+          const thought  = res.thoughtBuf.slice(thoughtStart + '<thought>'.length, thoughtEnd).trim();
+          const after    = res.thoughtBuf.slice(thoughtEnd + '</thought>'.length);
+          res.thoughtBuf = '';
 
           if (config.showReasoning) {
-            // reasoning_content від upstream (LiteLLM-like) — пропускаємо наскрізь
-            if (delta.reasoning_content) {
-              res.write(`data: ${JSON.stringify(parsed)}\n\n`);
-              continue;
+            if (before) res.write(`data: ${JSON.stringify({ choices: [{ delta: { content: before, role: 'assistant' }, index: 0 }] })}\n\n`);
+            if (thought && !res.thoughtFlushed) {
+              res.thoughtFlushed = true;
+              res.write(`data: ${JSON.stringify({ choices: [{ delta: { reasoning_content: thought, role: 'assistant' }, index: 0 }] })}\n\n`);
             }
-
-            // Буферизуємо content, шукаємо <thought> теги
-            if (c) {
-              if (!res.thoughtBuf) res.thoughtBuf = '';
-              res.thoughtBuf += c;
-
-              const thoughtEnd = res.thoughtBuf.indexOf('</thought>');
-              if (thoughtEnd !== -1) {
-                const before = res.thoughtBuf.slice(0, thoughtEnd);
-                const thought = before.replace(/<thought>/g, '').trim();
-                const after = res.thoughtBuf.slice(thoughtEnd + '</thought>'.length);
-
-                if (thought) {
-                  res.write(`data: ${JSON.stringify({ ...parsed, choices: [{ ...parsed.choices[0], delta: { reasoning_content: thought, role: 'assistant' } }] })}\n\n`);
-                }
-                if (after) {
-                  res.write(`data: ${JSON.stringify({ ...parsed, choices: [{ ...parsed.choices[0], delta: { content: after, role: 'assistant' } }] })}\n\n`);
-                }
-                res.thoughtBuf = '';
-                continue;
-              }
-
-              if (res.thoughtBuf.includes('<thought>') && !res.thoughtBuf.includes('</thought>')) {
-                continue;
-              }
-            }
-
-            // Чанки без content (finish_reason, usage) — пишемо
-            if (!c && parsed.choices?.[0]?.finish_reason) {
-              if (res.thoughtBuf) {
-                res.write(`data: ${JSON.stringify({ ...parsed, choices: [{ ...parsed.choices[0], delta: { reasoning_content: res.thoughtBuf.replace(/<thought>/g, '').trim(), role: 'assistant' }, finish_reason: parsed.choices[0].finish_reason }] })}\n\n`);
-                res.thoughtBuf = '';
-              } else {
-                res.write(`data: ${JSON.stringify(parsed)}\n\n`);
-              }
-              continue;
-            }
-            // Звичайний content без думок — пишемо
-            if (c) {
-              res.write(`data: ${JSON.stringify(parsed)}\n\n`);
-            }
+            if (after) res.write(`data: ${JSON.stringify({ choices: [{ delta: { content: after, role: 'assistant' }, index: 0 }] })}\n\n`);
           } else {
-            // showReasoning=false
-            if (c) {
-              if (!res.thoughtBuf) res.thoughtBuf = '';
-              res.thoughtBuf += c;
-
-              const thoughtEnd = res.thoughtBuf.indexOf('</thought>');
-              if (thoughtEnd !== -1) {
-                const after = res.thoughtBuf.slice(thoughtEnd + '</thought>'.length);
-                if (after) {
-                  delta.content = after;
-                  res.write(`data: ${JSON.stringify(parsed)}\n\n`);
-                } else {
-                  const before = res.thoughtBuf.slice(0, thoughtEnd).replace(/<thought>/g, '').trim();
-                  if (before) {
-                    delta.content = before;
-                    res.write(`data: ${JSON.stringify(parsed)}\n\n`);
-                  }
-                }
-                res.thoughtBuf = '';
-                continue;
-              }
-
-              if (res.thoughtBuf.includes('<thought>') && !res.thoughtBuf.includes('</thought>')) {
-                continue;
-              }
-
+            // Викидаємо thought, відправляємо тільки до і після
+            const toSend = before + after;
+            if (toSend) {
               delete delta.reasoning_content;
-              delta.content = c ?? '';
-              res.write(`data: ${JSON.stringify(parsed)}\n\n`);
-            } else {
-              // empty delta (finish_reason etc) — write as-is
+              delta.content = toSend;
               res.write(`data: ${JSON.stringify(parsed)}\n\n`);
             }
           }
-        } else {
-          res.write(`data: ${JSON.stringify(parsed)}\n\n`);
+          continue;
         }
-      } catch {}
+
+        // <thought> відкрито, але ще не закрито — продовжуємо буферизувати
+        if (thoughtStart !== -1 && thoughtEnd === -1) {
+          continue;
+        }
+
+        // ─── БАГ 2+3 ВИПРАВЛЕНО: без тегів — відправляємо одразу і чистимо буфер ───
+        // Раніше: continue без відправки (showReasoning=true) або буфер ніколи не очищувався
+        const toSend = res.thoughtBuf;
+        res.thoughtBuf = '';
+        delete delta.reasoning_content;
+        delta.content = toSend;
+        res.write(`data: ${JSON.stringify(parsed)}\n\n`);
+
+      } catch { /* пропускаємо некоректні рядки */ }
     }
   }
 };

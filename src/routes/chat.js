@@ -41,6 +41,9 @@ router.post('/chat/completions', async (req, res) => {
   if (systemContent) sanitizedMessages.unshift({ role: 'system', content: systemContent });
   req.body.messages = sanitizedMessages;
 
+  // ─── БАГ 5: stream завжди перевіряємо строго ===, а не truthiness ───
+  const isStream = req.body.stream === true;
+
   let lastError = null;
 
   for (const actualModelPath of modelChain) {
@@ -48,19 +51,14 @@ router.post('/chat/completions', async (req, res) => {
       let providerName = 'nvidia'; 
       let pureModelName = actualModelPath;
 
-      // ─── РОЗУМНИЙ ПАРСИНГ: ВІДРІЗАЄМО ТІЛЬКИ ПРОВАЙДЕРА ───
       if (actualModelPath.includes('/')) {
         const parts = actualModelPath.split('/');
         const firstPart = parts[0].toLowerCase();
         
-        // Якщо перше слово (напр. "nvidia" або "google") є в нашому config/providers.json
         if (providersConfig[firstPart]) {
           providerName = firstPart;
-          // Відрізаємо ТІЛЬКИ провайдера. 
-          // "nvidia/mistralai/mistral..." перетвориться на чисте "mistralai/mistral..."
           pureModelName = parts.slice(1).join('/'); 
         } else {
-          // Якщо клієнт прислав "mistralai/mistral..." без префікса "nvidia/"
           providerName = 'nvidia';
           pureModelName = actualModelPath;
         }
@@ -80,36 +78,35 @@ router.post('/chat/completions', async (req, res) => {
       const adapter = adapters[provider.type] || adapters.openai;
       const requestBody = adapter.formatReq(req.body, pureModelName);
 
-      // extra_body тільки для NVIDIA (Google його не підтримує)
+      // extra_body тільки для NVIDIA
       if (config.enableThinking && providerName === 'nvidia') {
         requestBody.extra_body = { chat_template_kwargs: { thinking: true } };
       }
 
-      const reqUrl = `${provider.baseUrl}/chat/completions`;
-      const headers = { 
-        'Content-Type': 'application/json'
-      };
-      
+      // ─── БАГ 4 ВИПРАВЛЕНО: було const — падало при type === 'gemini' ───
+      let reqUrl = `${provider.baseUrl}/chat/completions`;
+      const headers = { 'Content-Type': 'application/json' };
+
       if (provider.type === 'gemini') {
-        // Якщо раптом використовуєш старий адаптер Gemini
+        // Нативний Gemini API (якщо додати провайдера з type: "gemini" в providers.json)
         reqUrl = `${provider.baseUrl}/${pureModelName}:generateContent?key=${apiKey}`;
       } else {
-        // Для OpenAI-сумісних (NVIDIA, Groq, новий Google)
+        // OpenAI-сумісні провайдери (NVIDIA, Groq, Google через OpenAI compat)
         headers['Authorization'] = `Bearer ${apiKey}`;
       }
 
       const response = await axios({
         method: 'post', url: reqUrl, data: requestBody, headers,
-        responseType: req.body.stream ? 'stream' : 'json', timeout: config.timeoutMs,
+        responseType: isStream ? 'stream' : 'json', timeout: config.timeoutMs,
       });
 
       stats.success++; console.log(`[Router] ✅ Успішна відповідь від: ${actualModelPath}`);
 
-      if (req.body.stream) {
+      if (isStream) {
         res.setHeader('Content-Type', 'text/event-stream');
         res.setHeader('Cache-Control', 'no-cache');
         res.setHeader('Connection', 'keep-alive');
-        res.inReasoning = false;
+        // ─── БАГ: res.inReasoning — видалено, ніде не використовувалось ───
         response.data.on('data', chunk => adapter.parseStream(chunk, res, config));
         response.data.on('end', () => res.end());
         response.data.on('error', () => res.end());
