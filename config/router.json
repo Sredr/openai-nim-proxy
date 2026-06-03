@@ -2,16 +2,18 @@
   "aliases": {
     "deepseek": [
       "nvidia/deepseek-ai/deepseek-v4-pro",
-      "groq/deepseek-r1-distill-llama-70b-specdec",
+      "nvidia/google/gemma-4-31b-it",
+      "nvidia/google/gemma-4-26b-a4b-it",
       "fast-fallback"
     ],
     "fast-fallback": [
-      "google/gemini-1.5-flash",
+      "google/gemini-2.0-flash-lite-001",
       "nvidia/meta/llama-3.1-8b-instruct"
     ],
     "claude-coder": [
-      "google/gemini-1.5-pro",
-      "nvidia/deepseek-ai/deepseek-v4-pro"
+      "google/gemini-3.1-flash-lite",
+      "nvidia/google/gemma-4-31b-it",
+      "nvidia/meta/llama-3.1-8b-instruct"
     ]
   }
 }
