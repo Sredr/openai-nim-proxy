@@ -50,11 +50,16 @@ async function fetchWithRetry(axiosConfig) {
 }
 
 function extractApiKey(req, providerName = 'nvidia') {
+  // 1. Спочатку перевіряємо, чи є глобальний ключ у змінних оточення Render
   const envKey = process.env[`${providerName.toUpperCase()}_API_KEY`];
   if (envKey) return envKey;
+
+  // 2. Якщо в env порожньо — беремо ключ, який передав сам клієнт у заголовок
   const authHeader = req.headers['authorization'] ?? '';
   const raw = authHeader.startsWith('Bearer ') ? authHeader.slice(7).trim() : null;
   if (!raw) return null;
+
+  // Клієнт міг передати кілька ключів через кому (твій старий функціонал)
   const keys = raw.split(',').map(k => k.trim()).filter(Boolean);
   return keys.length ? keys[Math.floor(Math.random() * keys.length)] : null;
 }
