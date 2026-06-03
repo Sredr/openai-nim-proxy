@@ -125,29 +125,16 @@ function handleError(err, res) {
 app.use(cors());
 app.use(express.json({ limit: '50mb' }));
 
-// ─── Моделі що використовують genai endpoint ──────────────────────────────
-const GENAI_MODELS = new Set([
-  'black-forest-labs/flux.1-dev',
-  'black-forest-labs/flux.1-schnell',
-  'black-forest-labs/flux.1-canny',
-  'black-forest-labs/flux.1-depth',
-  'black-forest-labs/flux.1-fill',
-  'black-forest-labs/flux.1-redux',
-  'stabilityai/stable-diffusion-xl-base-1.0',
-  'stabilityai/stable-diffusion-3.5-large',
-  'stabilityai/stable-diffusion-3.5-medium',
-  'stabilityai/stable-diffusion-3-medium',
-  'nvidia/sana-1.5-4.8b',
-  'nvidia/sana-1.5-1.6b',
-  'nvidia/sana-1.0-1.6b',
-  'nvidia/cosmos-predict1-7b',
-  'nvidia/cosmos-predict1-14b',
-]);
 
 // Конвертує тіло OpenAI → NVIDIA genai формат
 function toGenaiBody(body) {
   const out = { prompt: body.prompt };
-  if (body.negative_prompt) out.negative_prompt = body.negative_prompt;
+  
+  // Якщо є negative_prompt, додаємо його ТІЛЬКИ якщо це не Flux (Flux падає з помилкою)
+  if (body.negative_prompt && (!body.model || !String(body.model).toLowerCase().includes('flux'))) {
+    out.negative_prompt = body.negative_prompt;
+  }
+  
   out.cfg_scale = body.cfg_scale ?? body.guidance_scale ?? body.scale ?? 3.5;
   out.steps = body.steps ?? body.num_inference_steps ?? 30;
   if (body.width)  out.width  = Number(body.width);
@@ -177,6 +164,12 @@ function toIntegrateBody(body) {
     out.guidance_scale = out.scale;
     delete out.scale;
   }
+  
+  // Flux моделі на NVIDIA не підтримують negative_prompt і падають з помилкою 422/404
+  if (out.model && String(out.model).toLowerCase().includes('flux')) {
+    delete out.negative_prompt;
+  }
+  
   return out;
 }
 
@@ -505,9 +498,6 @@ app.post('/v1/embeddings', async (req, res) => {
 });
 
 // ─── POST /v1/images/generations ─────────────────────────────────────────────
-// Універсальний: GENAI_MODELS → ai.api.nvidia.com/v1/genai/<model>
-//                інші         → integrate.api.nvidia.com/v1/images/generations
-// З автоматичним fallback на другий endpoint при 400/404/422/405.
 app.post('/v1/images/generations', async (req, res) => {
   const apiKey = extractApiKey(req);
   if (!apiKey) return res.status(401).json({ error: { message: 'Відсутній API ключ', code: 401 } });
@@ -517,24 +507,11 @@ app.post('/v1/images/generations', async (req, res) => {
   const model = String(req.body.model).trim();
   stats.total++; trackEndpoint('POST /v1/images/generations');
 
-  const isGenaiModel = GENAI_MODELS.has(model);
-
-  async function tryGenai() {
-    const url = `${GENAI_BASE}/${model}`;
-    const body = toGenaiBody(req.body);
-    console.log(`[img] genai → ${url}`, JSON.stringify(body).slice(0, 100));
-    const r = await fetchWithRetry({
-      method: 'post', url, data: body,
-      headers: { 'Authorization': `Bearer ${apiKey}`, 'Content-Type': 'application/json', 'Accept': 'application/json' },
-      timeout: config.timeoutMs,
-    });
-    return fromGenaiResponse(r.data);
-  }
-
+  // Функція для запиту до нового API (integrate)
   async function tryIntegrate() {
     const url = `${NIM_API_BASE}/images/generations`;
     const body = toIntegrateBody(req.body);
-    console.log(`[img] integrate → ${url}`, JSON.stringify(body).slice(0, 100));
+    console.log(`[img] integrate → ${url}`, JSON.stringify(body).slice(0, 150));
     const r = await fetchWithRetry({
       method: 'post', url, data: body,
       headers: { 'Authorization': `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
@@ -543,30 +520,41 @@ app.post('/v1/images/generations', async (req, res) => {
     return r.data;
   }
 
+  // Функція для запиту до старого API (genai)
+  async function tryGenai() {
+    const url = `${GENAI_BASE}/${model}`;
+    const body = toGenaiBody(req.body);
+    console.log(`[img] genai → ${url}`, JSON.stringify(body).slice(0, 150));
+    const r = await fetchWithRetry({
+      method: 'post', url, data: body,
+      headers: { 'Authorization': `Bearer ${apiKey}`, 'Content-Type': 'application/json', 'Accept': 'application/json' },
+      timeout: config.timeoutMs,
+    });
+    return fromGenaiResponse(r.data);
+  }
+
+  // Статуси помилок, при яких варто спробувати інший ендпоінт
   const fallbackStatuses = new Set([400, 404, 405, 422]);
 
   try {
     let result;
-    if (isGenaiModel) {
-      try { result = await tryGenai(); }
-      catch (e) {
-        if (fallbackStatuses.has(e.response?.status)) {
-          console.warn(`[img] genai→${e.response.status}, fallback integrate`);
-          result = await tryIntegrate();
-        } else throw e;
-      }
-    } else {
-      try { result = await tryIntegrate(); }
-      catch (e) {
-        if (fallbackStatuses.has(e.response?.status)) {
-          console.warn(`[img] integrate→${e.response.status}, fallback genai`);
-          result = await tryGenai();
-        } else throw e;
+    try {
+      // КРОК 1: Завжди спочатку пробуємо новий стандартний API (integrate)
+      result = await tryIntegrate();
+    } catch (e) {
+      // КРОК 2: Якщо сервер повернув помилку "не знайдено" або "неправильні параметри" — пробуємо старий (genai)
+      if (e.response && fallbackStatuses.has(e.response.status)) {
+        console.warn(`[img] integrate відхилив запит (статус ${e.response.status}), робимо автоматичний fallback на genai...`);
+        result = await tryGenai();
+      } else {
+        throw e; // Якщо це 401 (немає грошей) або 500 (сервер лежить) — кидаємо помилку далі
       }
     }
     stats.success++;
     res.json(result);
-  } catch (err) { handleError(err, res); }
+  } catch (err) {
+    handleError(err, res);
+  }
 });
 
 // ─── POST /v1/audio/transcriptions ──────────────────────────────────────────
