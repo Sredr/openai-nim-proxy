@@ -16,11 +16,16 @@ const stats = {
   total: 0, success: 0,
   err429: 0, err5xx: 0, errOther: 0,
   byEndpoint: {},
+  byProvider: {}, // Новий лічильник для провайдерів
   startTime: Date.now(),
 };
 
 function trackEndpoint(name) {
   stats.byEndpoint[name] = (stats.byEndpoint[name] ?? 0) + 1;
+}
+
+function trackProvider(name) {
+  stats.byProvider[name] = (stats.byProvider[name] ?? 0) + 1;
 }
 
 async function fetchWithRetry(axiosConfig) {
@@ -50,16 +55,13 @@ async function fetchWithRetry(axiosConfig) {
 }
 
 function extractApiKey(req, providerName = 'nvidia') {
-  // 1. Спочатку перевіряємо, чи є глобальний ключ у змінних оточення Render
   const envKey = process.env[`${providerName.toUpperCase()}_API_KEY`];
   if (envKey) return envKey;
 
-  // 2. Якщо в env порожньо — беремо ключ, який передав сам клієнт у заголовок
   const authHeader = req.headers['authorization'] ?? '';
   const raw = authHeader.startsWith('Bearer ') ? authHeader.slice(7).trim() : null;
   if (!raw) return null;
 
-  // Клієнт міг передати кілька ключів через кому (твій старий функціонал)
   const keys = raw.split(',').map(k => k.trim()).filter(Boolean);
   return keys.length ? keys[Math.floor(Math.random() * keys.length)] : null;
 }
@@ -82,4 +84,4 @@ function handleError(err, res) {
   if (res && !res.headersSent) res.status(status).json({ error: { message, code: status } });
 }
 
-module.exports = { config, stats, trackEndpoint, fetchWithRetry, extractApiKey, handleError };
+module.exports = { config, stats, trackEndpoint, trackProvider, fetchWithRetry, extractApiKey, handleError };
