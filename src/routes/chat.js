@@ -9,11 +9,17 @@ const { extractApiKey, handleError, trackEndpoint, stats, config } = require('..
 function resolveModelChain(modelName, visited = new Set()) {
   if (visited.has(modelName)) return [];
   visited.add(modelName);
+  
+  // Якщо в router.json є такий аліас (напр. "deepseek"), розгортаємо ланцюжок
   const chain = routerConfig.aliases?.[modelName];
-  if (!chain) return [modelName];
-  let resolvedChain = [];
-  for (const item of chain) resolvedChain.push(...resolveModelChain(item, visited));
-  return resolvedChain;
+  if (chain) {
+    let resolvedChain = [];
+    for (const item of chain) resolvedChain.push(...resolveModelChain(item, visited));
+    return resolvedChain;
+  }
+  
+  // Якщо аліасу немає, повертаємо саму модель як єдиний елемент ланцюжка
+  return [modelName];
 }
 
 router.post('/completions', async (req, res) => {
@@ -22,8 +28,7 @@ router.post('/completions', async (req, res) => {
   const requestedAlias = req.body.model || 'default';
   const modelChain = resolveModelChain(requestedAlias);
 
-  if (modelChain.length === 0) return res.status(400).json({ error: { message: `Модель '${requestedAlias}' не знайдено` } });
-
+  // Санітизація повідомлень (твоя оригінальна логіка)
   let sanitizedMessages = [];
   let systemContent = '';
   for (const msg of req.body.messages || []) {
@@ -47,6 +52,7 @@ router.post('/completions', async (req, res) => {
       let providerName = 'nvidia'; 
       let pureModelName = actualModelPath;
 
+      // Автоматично розбиваємо "google/gemma-4-31b-it" -> провайдер: google, модель: gemma-4-31b-it
       if (actualModelPath.includes('/')) {
         const parts = actualModelPath.split('/');
         providerName = parts[0].toLowerCase();
@@ -54,25 +60,35 @@ router.post('/completions', async (req, res) => {
       }
 
       const provider = providersConfig[providerName] || { type: 'openai', baseUrl: 'https://integrate.api.nvidia.com/v1' };
+      
+      // Дістаємо ключ (він успішно візьметься з твого Bearer токена)
       const apiKey = extractApiKey(req, providerName);
 
-      if (!apiKey) { console.warn(`[Router] ⚠️ Немає API ключа для ${providerName}`); continue; }
-      console.log(`[Router] ➡️ Пробую: ${providerName} | ${pureModelName}`);
+      if (!apiKey) { 
+        console.warn(`[Router] ⚠️ Не знайдено API ключ для провайдера: ${providerName}. Пропускаю модель ${pureModelName}`); 
+        continue; 
+      }
+      
+      console.log(`[Router] ➡️ Направляю на: ${providerName} | Чиста модель: ${pureModelName}`);
 
       const adapter = adapters[provider.type] || adapters.openai;
       const requestBody = adapter.formatReq(req.body, pureModelName);
 
       let reqUrl = `${provider.baseUrl}/chat/completions`;
       let headers = { 'Content-Type': 'application/json' };
-      if (provider.type === 'gemini') reqUrl = `${provider.baseUrl}/${pureModelName}:generateContent?key=${apiKey}`;
-      else headers['Authorization'] = `Bearer ${apiKey}`;
+      
+      if (provider.type === 'gemini') {
+        reqUrl = `${provider.baseUrl}/${pureModelName}:generateContent?key=${apiKey}`;
+      } else {
+        headers['Authorization'] = `Bearer ${apiKey}`;
+      }
 
       const response = await axios({
         method: 'post', url: reqUrl, data: requestBody, headers,
         responseType: req.body.stream ? 'stream' : 'json', timeout: config.timeoutMs,
       });
 
-      stats.success++; console.log(`[Router] ✅ Успіх на: ${actualModelPath}`);
+      stats.success++; console.log(`[Router] ✅ Успішна відповідь від: ${actualModelPath}`);
 
       if (req.body.stream) {
         res.setHeader('Content-Type', 'text/event-stream');
@@ -98,7 +114,7 @@ router.post('/completions', async (req, res) => {
     } catch (error) {
       lastError = error;
       const status = error.response?.status;
-      console.warn(`[Router] ❌ Помилка ${status || 'Network'} на ${actualModelPath}`);
+      console.warn(`[Router] ❌ Помилка ${status || 'Network'} на шляху ${actualModelPath}`);
       if (status === 400 || status === 401) break; 
     }
   }
