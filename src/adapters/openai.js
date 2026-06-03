@@ -1,5 +1,10 @@
-function stripThoughtTags(text) {
-  return text.replace(/<thought>[\s\S]*?<\/thought>/g, '').trim();
+function extractThoughtTags(text) {
+  const match = text.match(/^<thought>[\s\S]*?<\/thought>/);
+  if (!match) return { thought: null, content: text };
+  return {
+    thought: match[0].replace(/<\/?thought>/g, '').trim(),
+    content: text.slice(match[0].length).trim()
+  };
 }
 
 function cleanResponse(data, config) {
@@ -7,14 +12,27 @@ function cleanResponse(data, config) {
   for (const choice of data.choices) {
     if (choice.message) {
       delete choice.message.extra_content;
+      delete choice.message.thinking_blocks;
+      delete choice.message.images;
+      delete choice.message.vertex_ai_grounding_metadata;
+      delete choice.message.vertex_ai_url_context_metadata;
+      delete choice.message.vertex_ai_safety_results;
+      delete choice.message.vertex_ai_citation_metadata;
       
-      if (!config?.showReasoning) {
-        delete choice.message.reasoning_content;
-        if (choice.message.content) {
-          choice.message.content = stripThoughtTags(choice.message.content);
+      if (config?.showReasoning) {
+        // Якщо в content є <thought> — витягуємо в reasoning_content
+        const { thought, content } = extractThoughtTags(choice.message.content || '');
+        if (thought) {
+          choice.message.reasoning_content = thought;
+          choice.message.content = content;
         }
       } else {
+        // Видаляємо reasoning_content і <thought> теги з content
         delete choice.message.reasoning_content;
+        if (choice.message.content) {
+          const { content } = extractThoughtTags(choice.message.content);
+          choice.message.content = content;
+        }
       }
     }
   }
