@@ -57,7 +57,7 @@ router.post('/completions', async (req, res) => {
         
         if (providersConfig[possibleProvider]) {
           providerName = possibleProvider;
-          pureModelName = parts.slice(1).join('/'); // Відрізаємо префікс (напр. "google/gemma..." -> "gemma...")
+          pureModelName = parts.slice(1).join('/'); // Відрізаємо префікс (напр. "google/gemma-4-31b-it" -> "gemma-4-31b-it")
         } else {
           // Якщо перша частина — це розробник моделі (meta, mistralai), залишаємо назву цілою для NVIDIA
           providerName = 'nvidia';
@@ -78,21 +78,24 @@ router.post('/completions', async (req, res) => {
       
       console.log(`[Router] ➡️ Направляю на: ${providerName} | Чиста модель: ${pureModelName}`);
 
+      // Завжди використовуємо OpenAI адаптер, якщо тип провайдера openai (включаючи новий API Google)
       const adapter = adapters[provider.type] || adapters.openai;
       const requestBody = adapter.formatReq(req.body, pureModelName);
 
-      let reqUrl = `${provider.baseUrl}/chat/completions`;
-      let headers = { 'Content-Type': 'application/json' };
-      
-      if (provider.type === 'gemini') {
-        reqUrl = `${provider.baseUrl}/${pureModelName}:generateContent?key=${apiKey}`;
-      } else {
-        headers['Authorization'] = `Bearer ${apiKey}`;
-      }
+      // Формуємо URL та заголовки суворо за стандартом OpenAI
+      const reqUrl = `${provider.baseUrl}/chat/completions`;
+      const headers = { 
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${apiKey}`
+      };
 
       const response = await axios({
-        method: 'post', url: reqUrl, data: requestBody, headers,
-        responseType: req.body.stream ? 'stream' : 'json', timeout: config.timeoutMs,
+        method: 'post', 
+        url: reqUrl, 
+        data: requestBody, 
+        headers,
+        responseType: req.body.stream ? 'stream' : 'json', 
+        timeout: config.timeoutMs,
       });
 
       stats.success++; console.log(`[Router] ✅ Успішна відповідь від: ${actualModelPath}`);
