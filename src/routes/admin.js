@@ -1,7 +1,7 @@
 const express = require('express');
 const { randomUUID } = require('crypto');
 const router = express.Router();
-const helpers = require('../utils/helpers'); // Імпортуємо весь об'єкт, щоб міняти config всередині
+const helpers = require('../utils/helpers');
 
 let ADMIN_KEY = process.env.ADMIN_KEY ?? '';
 if (!ADMIN_KEY) {
@@ -59,8 +59,8 @@ function buildAdminHtml() {
   </style>
 </head>
 <body>
-  <h1>🚀 NIM Universal Proxy</h1>
-  <p class="sub">Підтримує: chat · embeddings · images (genai + integrate) · audio · TTS · STT</p>
+  <h1>🚀 Universal Proxy Routing</h1>
+  <p class="sub">Підтримує: chat (AI Orchestrator) · embeddings · images · audio</p>
   <div class="stats" id="statsGrid">
     <div class="stat"><div class="stat-val" id="sTotal">—</div><div class="stat-lbl">Всього запитів</div></div>
     <div class="stat"><div class="stat-val" id="sSuccess">—</div><div class="stat-lbl">Успішних</div></div>
@@ -68,11 +68,34 @@ function buildAdminHtml() {
     <div class="stat err"><div class="stat-val" id="s5xx">—</div><div class="stat-lbl">5xx помилки</div></div>
   </div>
   <div class="uptime" id="uptimeEl"></div>
+  
+  <div class="card">
+    <div class="card-title">🏢 Запити по провайдерах</div>
+    <div class="ep-grid" id="provGrid"><div class="ep-name" style="color:#444">Поки немає даних</div><div></div></div>
+  </div>
+
   <div class="card">
     <div class="card-title">📡 Запити по ендпоінтах</div>
     <div class="ep-grid" id="epGrid"><div class="ep-name" style="color:#444">Поки немає даних</div><div></div></div>
   </div>
+
+  <div class="card">
+    <div class="card-title">🔌 Доступні ендпоінти</div>
+    <div class="endpoints-info">
+      <code>POST /v1/chat/completions</code> — чат, reasoning, стрімінг<br>
+      <code>POST /v1/embeddings</code> — текстові ембединги<br>
+      <code>POST /v1/images/generations</code> — зображення<br>
+      <code>POST /v1/audio/transcriptions</code> — STT<br>
+      <code>POST /v1/audio/translations</code> — переклад аудіо<br>
+      <code>POST /v1/audio/speech</code> — TTS<br>
+      <code>POST /v1/completions</code> — legacy<br>
+      <code>GET &nbsp;/v1/models</code> — список моделей<br>
+      <code>ANY &nbsp;/v1/*</code> — pass-through
+    </div>
+  </div>
+
   ${ADMIN_KEY ? `<div id="keyWrap"><input id="keyInput" type="password" placeholder="🔑 Ключ адміна..."></div>` : ''}
+  
   <div class="card">
     <div class="card-title">🧠 Мислення (для chat)</div>
     <div class="row">
@@ -91,6 +114,7 @@ function buildAdminHtml() {
   </div>
   <button class="btn" onclick="save()">💾 Зберегти</button>
   <div id="status"></div>
+  
   <script>
     const $ = id => document.getElementById(id);
     function fmtUptime(ms) {
@@ -106,10 +130,17 @@ function buildAdminHtml() {
         $('sTotal').textContent = s.total; $('sSuccess').textContent = s.success;
         $('s429').textContent = s.err429; $('s5xx').textContent = s.err5xx;
         $('uptimeEl').textContent = 'Аптайм: ' + fmtUptime(s.uptimeMs);
+        
         const ep = s.byEndpoint ?? {};
-        const keys = Object.keys(ep);
-        if (keys.length) $('epGrid').innerHTML = keys.sort((a,b)=>ep[b]-ep[a]).map(k =>
+        const epKeys = Object.keys(ep);
+        if (epKeys.length) $('epGrid').innerHTML = epKeys.sort((a,b)=>ep[b]-ep[a]).map(k =>
           \`<div class="ep-name">\${k}</div><div class="ep-cnt">\${ep[k]}</div>\`).join('');
+
+        const prov = s.byProvider ?? {};
+        const pKeys = Object.keys(prov);
+        if (pKeys.length) $('provGrid').innerHTML = pKeys.sort((a,b)=>prov[b]-prov[a]).map(k =>
+          \`<div class="ep-name">\${k}</div><div class="ep-cnt">\${prov[k]}</div>\`).join('');
+
       } catch {}
     }
     async function load() {
