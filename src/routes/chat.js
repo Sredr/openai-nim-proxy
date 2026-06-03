@@ -3,6 +3,7 @@ const axios = require('axios');
 const router = express.Router();
 const providersConfig = require('../../config/providers.json');
 const routerConfig = require('../../config/router.json');
+const adapters = require('../adapters');
 const { extractApiKey, handleError, trackEndpoint, trackProvider, stats, config } = require('../utils/helpers');
 
 function resolveModelChain(modelName, visited = new Set()) {
@@ -25,7 +26,7 @@ router.post('/completions', async (req, res) => {
   const requestedAlias = req.body.model || 'default';
   const modelChain = resolveModelChain(requestedAlias);
 
-  // Санітизація повідомлень (твоя оригінальна логіка)
+  // Санітизація повідомлень
   let sanitizedMessages = [];
   let systemContent = '';
   for (const msg of req.body.messages || []) {
@@ -49,19 +50,19 @@ router.post('/completions', async (req, res) => {
       let providerName = 'nvidia'; 
       let pureModelName = actualModelPath;
 
-      // ─── ТОЧНИЙ І НАДІЙНИЙ РОЗБІР ПРОВАЙДЕРІВ ───
+      // ─── РОЗУМНИЙ ПАРСИНГ: ВІДРІЗАЄМО ТІЛЬКИ ПРОВАЙДЕРА ───
       if (actualModelPath.includes('/')) {
         const parts = actualModelPath.split('/');
         const firstPart = parts[0].toLowerCase();
         
-        // Перевіряємо, чи перше слово є зареєстрованим провайдером (напр. "nvidia" або "google")
+        // Якщо перше слово (напр. "nvidia" або "google") є в нашому config/providers.json
         if (providersConfig[firstPart]) {
           providerName = firstPart;
-          // Відрізаємо ТІЛЬКИ префікс провайдера, зберігаючи решту шляху (напр. "mistralai/mistral-large...")
+          // Відрізаємо ТІЛЬКИ провайдера. 
+          // "nvidia/mistralai/mistral..." перетвориться на чисте "mistralai/mistral..."
           pureModelName = parts.slice(1).join('/'); 
         } else {
-          // Якщо першого слова немає в провайдерах (напр. запит типу "mistralai/mistral-large..."), 
-          // то за замовчуванням шлемо на nvidia, залишаючи всю назву моделі цілою
+          // Якщо клієнт прислав "mistralai/mistral..." без префікса "nvidia/"
           providerName = 'nvidia';
           pureModelName = actualModelPath;
         }
@@ -76,26 +77,27 @@ router.post('/completions', async (req, res) => {
       }
       
       trackProvider(providerName);
-      console.log(`[Router] ➡️ Направляю на: ${providerName} | Модель для API: ${pureModelName}`);
+      console.log(`[Router] ➡️ Направляю на: ${providerName} | Чиста модель: ${pureModelName}`);
 
-      const nimBody = {
-        ...req.body,
-        model: pureModelName
-      };
+      const adapter = adapters[provider.type] || adapters.openai;
+      const requestBody = adapter.formatReq(req.body, pureModelName);
 
       const reqUrl = `${provider.baseUrl}/chat/completions`;
       const headers = { 
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${apiKey}`
+        'Content-Type': 'application/json'
       };
+      
+      if (provider.type === 'gemini') {
+        // Якщо раптом використовуєш старий адаптер Gemini
+        reqUrl = `${provider.baseUrl}/${pureModelName}:generateContent?key=${apiKey}`;
+      } else {
+        // Для OpenAI-сумісних (NVIDIA, Groq, новий Google)
+        headers['Authorization'] = `Bearer ${apiKey}`;
+      }
 
       const response = await axios({
-        method: 'post', 
-        url: reqUrl, 
-        data: nimBody, 
-        headers,
-        responseType: req.body.stream ? 'stream' : 'json', 
-        timeout: config.timeoutMs,
+        method: 'post', url: reqUrl, data: requestBody, headers,
+        responseType: req.body.stream ? 'stream' : 'json', timeout: config.timeoutMs,
       });
 
       stats.success++; console.log(`[Router] ✅ Успішна відповідь від: ${actualModelPath}`);
@@ -104,60 +106,21 @@ router.post('/completions', async (req, res) => {
         res.setHeader('Content-Type', 'text/event-stream');
         res.setHeader('Cache-Control', 'no-cache');
         res.setHeader('Connection', 'keep-alive');
-        
-        let buffer = '', inReasoning = false;
-        
-        response.data.on('data', chunk => {
-          buffer += chunk.toString();
-          const lines = buffer.split('\n');
-          buffer = lines.pop() ?? '';
-          
-          for (const line of lines) {
-            const t = line.trim();
-            if (!t) continue;
-            if (t === 'data: [DONE]') { res.write('data: [DONE]\n\n'); continue; }
-            if (!t.startsWith('data: ')) continue;
-            try {
-              const data = JSON.parse(t.slice(6));
-              const delta = data.choices?.[0]?.delta;
-              if (delta) {
-                const rc = delta.reasoning_content, c = delta.content;
-                if (config.showReasoning) {
-                  let out = '';
-                  if (rc && !inReasoning) { out = '<think>\n' + rc; inReasoning = true; }
-                  else if (rc) out = rc;
-                  if (c && inReasoning) { out += '\n</think>\n\n' + c; inReasoning = false; }
-                  else if (c) out += c;
-                  delta.content = out || '';
-                } else {
-                  if (rc && !c) continue;
-                  delta.content = c ?? '';
-                }
-                delete delta.reasoning_content;
-              }
-              res.write(`data: ${JSON.stringify(data)}\n\n`);
-            } catch {}
-          }
-        });
-        
-        res.on('close', () => {
-          if (response.data && typeof response.data.destroy === 'function') {
-            response.data.destroy();
-          }
-        });
-        
+        res.inReasoning = false;
+        response.data.on('data', chunk => adapter.parseStream(chunk, res, config));
         response.data.on('end', () => res.end());
         response.data.on('error', () => res.end());
       } else {
-        const data = response.data;
-        for (const choice of data.choices ?? []) {
-          const msg = choice.message;
-          if (!msg) continue;
-          if (config.showReasoning && msg.reasoning_content)
-            msg.content = `<think>\n${msg.reasoning_content}\n</think>\n\n${msg.content ?? ''}`;
-          delete msg.reasoning_content;
+        const finalData = adapter.formatRes(response.data);
+        if (provider.type === 'openai') {
+          for (const choice of finalData.choices ?? []) {
+            if (choice.message?.reasoning_content && config.showReasoning) {
+              choice.message.content = `<think>\n${choice.message.reasoning_content}\n</think>\n\n${choice.message.content ?? ''}`;
+              delete choice.message.reasoning_content;
+            }
+          }
         }
-        res.json(data);
+        res.json(finalData);
       }
       return; 
     } catch (error) {
