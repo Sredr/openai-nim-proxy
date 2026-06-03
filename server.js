@@ -16,7 +16,7 @@ app.use(cors());
 app.use(express.json({ limit: '50mb' }));
 
 // Підключення модулів
-app.use('/v1/chat', chatRoutes);
+app.use('/v1', chatRoutes);
 app.use('/v1', mediaRoutes);
 app.use('/admin', adminRoutes);
 
