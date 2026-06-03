@@ -1,10 +1,10 @@
 function extractThoughtTags(text) {
   const match = text.match(/^<thought>[\s\S]*?<\/thought>/);
   if (!match) return { thought: null, content: text };
-  const thought = match[0].replace(/<\/?thought>/g, '').trim();
-  const content = text.slice(match[0].length).trim();
-  // Якщо після </thought> нічого немає — думки є і відповіддю
-  return { thought, content: content || thought };
+  return {
+    thought: match[0].replace(/<\/?thought>/g, '').trim(),
+    content: text.slice(match[0].length).trim()
+  };
 }
 
 function cleanResponse(data, config) {
@@ -19,20 +19,16 @@ function cleanResponse(data, config) {
       delete choice.message.vertex_ai_safety_results;
       delete choice.message.vertex_ai_citation_metadata;
 
+      const { thought, content } = extractThoughtTags(choice.message.content || '');
+      
       if (config?.showReasoning) {
-        const { thought, content } = extractThoughtTags(choice.message.content || '');
-        if (thought) {
-          choice.message.reasoning_content = thought;
-          choice.message.content = content;
-        }
+        // showReasoning=true: думки в reasoning_content, content — все що після </thought>
+        choice.message.reasoning_content = thought || choice.message.reasoning_content;
+        choice.message.content = content || thought || '';
       } else {
-        const { thought, content } = extractThoughtTags(choice.message.content || '');
+        // showReasoning=false: думки в content (якщо content пустий)
         delete choice.message.reasoning_content;
-        if (content) {
-          choice.message.content = content;
-        } else if (thought) {
-          choice.message.content = thought;
-        }
+        choice.message.content = content || thought || '';
       }
     }
   }
