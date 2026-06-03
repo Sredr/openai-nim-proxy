@@ -1,16 +1,23 @@
+function stripThoughtTags(text) {
+  return text.replace(/<thought>[\s\S]*?<\/thought>/g, '').trim();
+}
+
 function cleanResponse(data, config) {
   if (!data?.choices) return data;
   for (const choice of data.choices) {
     if (choice.message) {
-      // Видаляємо специфічні поля Google (extra_content, thought_signature тощо)
       delete choice.message.extra_content;
-      // Якщо showReasoning вимкнено — прибираємо reasoning_content
+      
       if (!config?.showReasoning) {
+        delete choice.message.reasoning_content;
+        if (choice.message.content) {
+          choice.message.content = stripThoughtTags(choice.message.content);
+        }
+      } else {
         delete choice.message.reasoning_content;
       }
     }
   }
-  // Також на верхньому рівні буває
   delete data.extra_content;
   return data;
 }

@@ -41,8 +41,6 @@ router.post('/chat/completions', async (req, res) => {
   if (systemContent) sanitizedMessages.unshift({ role: 'system', content: systemContent });
   req.body.messages = sanitizedMessages;
 
-  if (config.enableThinking) req.body.extra_body = { chat_template_kwargs: { thinking: true } };
-
   let lastError = null;
 
   for (const actualModelPath of modelChain) {
@@ -81,6 +79,11 @@ router.post('/chat/completions', async (req, res) => {
 
       const adapter = adapters[provider.type] || adapters.openai;
       const requestBody = adapter.formatReq(req.body, pureModelName);
+
+      // extra_body тільки для NVIDIA (Google його не підтримує)
+      if (config.enableThinking && providerName === 'nvidia') {
+        requestBody.extra_body = { chat_template_kwargs: { thinking: true } };
+      }
 
       const reqUrl = `${provider.baseUrl}/chat/completions`;
       const headers = { 
