@@ -1,4 +1,10 @@
 const axios = require('axios');
+const http = require('http');
+const https = require('https');
+
+// HTTP keep-alive агенти для швидшого з'єднання
+const httpAgent = new http.Agent({ keepAlive: true, maxSockets: 100, timeout: 60000 });
+const httpsAgent = new https.Agent({ keepAlive: true, maxSockets: 100, timeout: 60000 });
 
 const config = {
   showReasoning:            process.env.SHOW_REASONING !== 'false',
@@ -36,6 +42,12 @@ function trackProvider(name) {
 }
 
 async function fetchWithRetry(axiosConfig) {
+  // Додаємо keep-alive агенти до конфігу
+  if (!axiosConfig.httpAgent && !axiosConfig.httpsAgent) {
+    axiosConfig.httpAgent = httpAgent;
+    axiosConfig.httpsAgent = httpsAgent;
+  }
+
   let attempts5xx = 0, attempts429 = 0;
   while (true) {
     try {
@@ -76,22 +88,39 @@ async function fetchWithRetry(axiosConfig) {
 
 const PROVIDER_ORDER = ['nvidia', 'google', 'groq'];
 
-function extractApiKey(req, providerName = 'nvidia') {
-  const envKey = process.env[`${providerName.toUpperCase()}_API_KEY`];
-  if (envKey) return envKey;
+const keyRotationState = {};
 
+function getProviderKeys(providerName) {
+  // Спробуємо спочатку plural версію (напр. GOOGLE_API_KEYS), потім singular
+  const keysEnv = process.env[`${providerName.toUpperCase()}_API_KEYS`] || process.env[`${providerName.toUpperCase()}_API_KEY`];
+  if (!keysEnv) return [];
+  return keysEnv.split(',').map(k => k.trim()).filter(Boolean);
+}
+
+function extractApiKey(req, providerName = 'nvidia') {
+  // 1. Перевіряємо заголовки (для динамічного керування ключами клієнтом)
   const authHeader = req.headers['authorization'] ?? '';
   const raw = authHeader.startsWith('Bearer ') ? authHeader.slice(7).trim() : null;
-  if (!raw) return null;
-
-  const keys = raw.split(',').map(k => k.trim()).filter(Boolean);
-  
-  if (keys.length > 1) {
-    const idx = PROVIDER_ORDER.indexOf(providerName);
-    return keys[idx % keys.length];
+  if (raw) {
+    const keys = raw.split(',').map(k => k.trim()).filter(Boolean);
+    if (keys.length > 1) {
+      const idx = PROVIDER_ORDER.indexOf(providerName);
+      return keys[idx % keys.length];
+    }
+    return keys[0];
   }
-  
-  return keys[0];
+
+  // 2. Використовуємо ротацію ключів з .env
+  const keys = getProviderKeys(providerName);
+  if (keys.length === 0) return null;
+  if (keys.length === 1) return keys[0];
+
+  // Ротація: збільшуємо індекс для кожного провайдера
+  keyRotationState[providerName] = (keyRotationState[providerName] ?? 0);
+  const key = keys[keyRotationState[providerName] % keys.length];
+  keyRotationState[providerName]++;
+
+  return key;
 }
 
 function safeStringify(val) {
@@ -116,7 +145,7 @@ function handleError(err, res) {
   const rawData = err.response?.data;
   const errClass = classifyError(err);
   let message = 'Помилка';
-  
+
   if (rawData?.detail) message = typeof rawData.detail === 'string' ? rawData.detail : safeStringify(rawData.detail);
   else if (rawData?.error?.message) message = rawData.error.message;
   else if (typeof err.message === 'string') message = err.message;
@@ -126,4 +155,4 @@ function handleError(err, res) {
   if (res && !res.headersSent) res.status(status).json({ error: { message, code: status } });
 }
 
-module.exports = { config, stats, trackEndpoint, trackProvider, fetchWithRetry, extractApiKey, handleError };
+module.exports = { config, stats, trackEndpoint, trackProvider, fetchWithRetry, extractApiKey, handleError, httpAgent, httpsAgent };

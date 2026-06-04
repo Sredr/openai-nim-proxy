@@ -4,7 +4,7 @@ const router = express.Router();
 const providersConfig = require('../../config/providers.json');
 const routerConfig = require('../../config/router.json');
 const adapters = require('../adapters');
-const { extractApiKey, handleError, trackEndpoint, trackProvider, stats, config } = require('../utils/helpers');
+const { extractApiKey, handleError, trackEndpoint, trackProvider, stats, config, httpAgent, httpsAgent } = require('../utils/helpers');
 
 function resolveModelChain(modelName, visited = new Set()) {
   if (visited.has(modelName)) return [];
@@ -105,14 +105,16 @@ router.post('/chat/completions', async (req, res) => {
       const provider = providersConfig[providerName] || providersConfig['nvidia'];
       const apiKey = extractApiKey(req, providerName);
 
+      console.log(`[Router] 🔑 apiKey для ${providerName}:`, apiKey ? apiKey.slice(0, 8) + '...' : 'null');
+
       if (!apiKey) { 
-        console.warn(`[Router] ⚠️ Не знайдено API ключ для провайдера: ${providerName}. Пропускаю модель ${pureModelName}`); 
-        continue; 
+        console.warn(`[Router] ⚠️ Ключ відсутній для ${providerName}. Повертаю 401.`); 
+        return res.status(401).json({ error: { message: `API ключ для ${providerName} не знайдено`, code: 401 } });
       }
       
-      if (apiKey === 'nvapi-') {
-        console.warn(`[Router] ⚠️ API ключ для ${providerName} є пустим (nvapi-). Пропускаю.`);
-        continue;
+      if (typeof apiKey === 'string' && (apiKey === 'nvapi-' || apiKey.endsWith('-') || apiKey.trim().length < 10)) { 
+        console.warn(`[Router] ⚠️ Невірний ключ для ${providerName}. Повертаю 401.`); 
+        return res.status(401).json({ error: { message: `Невірний API ключ для ${providerName}`, code: 401 } });
       }
       
       trackProvider(providerName);
@@ -157,6 +159,8 @@ router.post('/chat/completions', async (req, res) => {
         headers,
         responseType: isStream ? 'stream' : 'json',
         timeout: connectTimeoutMs,
+        httpAgent,
+        httpsAgent,
       });
 
       stats.success++;
