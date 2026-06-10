@@ -31,6 +31,29 @@ function setStreamHeaders(res) {
   if (res.flush) res.flush();
 }
 
+// ── KEEPALIVE для thinking-моделей ───────────────────────────────────────────
+// Render Free обриває з'єднання якщо 30с немає байт у відповіді.
+// Thinking-моделі (DeepSeek-R1, Gemini-thinking, QwQ тощо) можуть мовчати
+// 30-120с під час фази "роздумів" перш ніж почати стрімити.
+// Рішення: надсилаємо SSE-comment кожні 20с — клієнти їх ігнорують,
+// але Render/nginx бачать активність і не вбивають з'єднання.
+function startKeepalive(res, intervalMs = 20000) {
+  const timer = setInterval(() => {
+    if (res.writableEnded) {
+      clearInterval(timer);
+      return;
+    }
+    try {
+      // SSE comment — специфікація дозволяє, всі клієнти ігнорують
+      res.write(': ping\n\n');
+      if (res.flush) res.flush();
+    } catch {
+      clearInterval(timer);
+    }
+  }, intervalMs);
+  return timer;
+}
+
 router.post('/chat/completions', async (req, res) => {
   stats.total++; trackEndpoint('POST /v1/chat/completions');
   
@@ -58,6 +81,8 @@ router.post('/chat/completions', async (req, res) => {
   let lastError = null;
 
   for (const actualModelPath of modelChain) {
+    let keepaliveTimer = null;
+
     try {
       let providerName = 'nvidia'; 
       let pureModelName = actualModelPath;
@@ -89,7 +114,7 @@ router.post('/chat/completions', async (req, res) => {
       }
       
       trackProvider(providerName);
-      console.log(`[Router] ➡️ Направляю на: ${providerName} | Чиста модель: ${pureModelName}`);
+      console.log(`[Router] ➡️ Направляю на: ${providerName} | Модель: ${pureModelName} | stream=${isStream}`);
 
       const adapter = adapters[provider.type] || adapters.openai;
       const requestBody = adapter.formatReq(req.body, pureModelName);
@@ -107,31 +132,107 @@ router.post('/chat/completions', async (req, res) => {
         headers['Authorization'] = `Bearer ${apiKey}`;
       }
 
+      // ── ТАЙМАУТИ ──────────────────────────────────────────────────────────
+      // Axios timeout для stream — це таймаут на з'єднання + перший байт даних
+      // (тобто до отримання HTTP-headers від upstream). Після того як headers
+      // прийшли — таймаут більше не діє, і стрім може тривати скільки завгодно.
+      //
+      // Для thinking-моделей: якщо upstream ще не почав відповідати (немає
+      // навіть headers) за CONNECT_TIMEOUT — повертаємо помилку і пробуємо
+      // наступну модель у chain.
+      //
+      // Після отримання headers keepalive-таймер тримає з'єднання живим.
+      const connectTimeoutMs = isStream
+        ? (config.streamConnectTimeoutMs ?? 120000) // 2хв на з'єднання для стрімів
+        : config.timeoutMs;                          // 85с для звичайних запитів
+
+      const t0 = Date.now();
+
       const response = await axios({
-        method: 'post', url: reqUrl, data: requestBody, headers,
-        responseType: isStream ? 'stream' : 'json', timeout: config.timeoutMs,
+        method: 'post',
+        url: reqUrl,
+        data: requestBody,
+        headers,
+        responseType: isStream ? 'stream' : 'json',
+        timeout: connectTimeoutMs,
       });
 
-      stats.success++; console.log(`[Router] ✅ Успішна відповідь від: ${actualModelPath}`);
+      stats.success++;
+      const ttfb = Date.now() - t0;
+      console.log(`[Router] ✅ Відповідь від: ${actualModelPath} | TTFB: ${ttfb}ms`);
 
       if (isStream) {
-        setStreamHeaders(res); // ← виклик централізованої функції з X-Accel-Buffering
-        response.data.on('data', chunk => adapter.parseStream(chunk, res, config));
-        response.data.on('end', () => res.end());
-        response.data.on('error', () => res.end());
+        setStreamHeaders(res);
+
+        // Запускаємо keepalive ПІСЛЯ setStreamHeaders (щоб заголовки вже пішли)
+        keepaliveTimer = startKeepalive(res);
+
+        let bytesReceived = 0;
+
+        response.data.on('data', chunk => {
+          bytesReceived += chunk.length;
+          // Коли перший реальний chunk прийшов — keepalive більше не критичний,
+          // але залишаємо його на випадок пауз між токенами
+          try {
+            adapter.parseStream(chunk, res, config);
+          } catch (parseErr) {
+            console.error(`[Router] ⚠️ parseStream error:`, parseErr.message);
+          }
+        });
+
+        response.data.on('end', () => {
+          clearInterval(keepaliveTimer);
+          console.log(`[Router] 🏁 Стрім завершено: ${actualModelPath} | bytes=${bytesReceived}`);
+          if (!res.writableEnded) res.end();
+        });
+
+        response.data.on('error', (streamErr) => {
+          clearInterval(keepaliveTimer);
+          console.error(`[Router] ❌ Помилка стріму від ${actualModelPath}:`, streamErr.message);
+          // Якщо заголовки вже відправлені — не можемо змінити статус.
+          // Надсилаємо SSE-error щоб клієнт знав що стрім обірвався.
+          if (!res.writableEnded) {
+            try {
+              res.write(`data: ${JSON.stringify({ error: { message: streamErr.message, type: 'stream_error' } })}\n\n`);
+              res.write('data: [DONE]\n\n');
+            } catch {}
+            res.end();
+          }
+        });
+
+        // Обробка закриття з'єднання клієнтом (наприклад, SillyTavern натиснув Stop)
+        req.on('close', () => {
+          clearInterval(keepaliveTimer);
+          if (!response.data.destroyed) response.data.destroy();
+        });
+
       } else {
         const finalData = adapter.formatRes(response.data, config);
         res.json(finalData);
       }
       return; 
+
     } catch (error) {
+      if (keepaliveTimer) clearInterval(keepaliveTimer);
       lastError = error;
       const status = error.response?.status;
-      console.warn(`[Router] ❌ Помилка ${status || 'Network'} на шляху ${actualModelPath}`);
-      if (status === 400 || status === 401) break; 
+      const isTimeout = error.code === 'ECONNABORTED' || error.code === 'ETIMEDOUT';
+      const isNetwork = error.code === 'ECONNRESET' || error.code === 'ENOTFOUND' || error.code === 'ECONNREFUSED';
+
+      console.warn(
+        `[Router] ❌ Помилка на ${actualModelPath}:`,
+        status ? `HTTP ${status}` : error.code ?? error.message,
+        isTimeout ? '(таймаут з\'єднання)' : '',
+        isNetwork ? '(мережева помилка)' : ''
+      );
+
+      // 400/401 — не пробуємо далі (неправильний запит або ключ)
+      if (status === 400 || status === 401) break;
+      // Таймаут при стрімі — пробуємо наступну модель
+      // (інші помилки теж продовжують chain)
     }
   }
-  handleError(lastError || new Error("Всі моделі недоступні"), res);
+  handleError(lastError || new Error("Всі моделі в ланцюжку недоступні"), res);
 });
 
 module.exports = router;

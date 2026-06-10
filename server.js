@@ -20,7 +20,17 @@ app.use('/v1', chatRoutes);
 app.use('/v1', mediaRoutes);
 app.use('/admin', adminRoutes);
 
-app.get('/health', (req, res) => res.json({ status: 'ok', uptime: Date.now() - stats.startTime }));
+app.get('/health', (req, res) => res.json({
+  status: 'ok',
+  uptime: Date.now() - stats.startTime,
+  // Корисно для дебагу — видно поточний конфіг без адмінки
+  config: {
+    timeoutMs: config.timeoutMs,
+    streamConnectTimeoutMs: config.streamConnectTimeoutMs,
+    keepaliveIntervalMs: config.keepaliveIntervalMs,
+    maxRetries: config.maxRetries,
+  }
+}));
 
 // Pass-through для всіх інших /v1/* ендпоінтів (embeddings, completions, models)
 app.all('/v1/*', async (req, res) => {
@@ -68,10 +78,21 @@ app.all('*', (req, res) => res.status(404).json({
 }));
 
 // Render дає 30 секунд на graceful shutdown.
-// При 3с активні стріми просто обривались під час деплою.
+// Активні стріми отримують час завершитись.
+let isShuttingDown = false;
 process.on('SIGTERM', () => {
+  if (isShuttingDown) return;
+  isShuttingDown = true;
   console.log('SIGTERM отримано, завершую через 28с...');
-  setTimeout(() => process.exit(0), 28000);
+  setTimeout(() => {
+    console.log('Завершення процесу');
+    process.exit(0);
+  }, 28000);
 });
 
-app.listen(PORT, () => console.log(`✅ Universal Proxy запущено на порту ${PORT}`));
+app.listen(PORT, () => {
+  console.log(`✅ Universal Proxy запущено на порту ${PORT}`);
+  console.log(`   streamConnectTimeoutMs = ${config.streamConnectTimeoutMs}`);
+  console.log(`   keepaliveIntervalMs    = ${config.keepaliveIntervalMs}`);
+  console.log(`   timeoutMs              = ${config.timeoutMs}`);
+});
