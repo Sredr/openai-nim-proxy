@@ -170,11 +170,22 @@ router.post('/chat/completions', async (req, res) => {
         keepaliveTimer = startKeepalive(res);
 
         let bytesReceived = 0;
+        let chunkCount = 0;
+        let firstChunkAt = 0;         // ms від початку запиту до першого байта тіла
+        let lastChunkAt = t0;
+        let maxGapMs = 0;             // найбільша пауза між chunks (де upstream "думав")
+        const streamStart = Date.now();
 
         response.data.on('data', chunk => {
+          const now = Date.now();
+          const gap = now - lastChunkAt;
+          if (gap > maxGapMs) maxGapMs = gap;
+          lastChunkAt = now;
+
+          if (bytesReceived === 0) firstChunkAt = now - t0; // TTFB тіла (після headers)
           bytesReceived += chunk.length;
-          // Коли перший реальний chunk прийшов — keepalive більше не критичний,
-          // але залишаємо його на випадок пауз між токенами
+          chunkCount++;
+
           try {
             adapter.parseStream(chunk, res, config);
           } catch (parseErr) {
@@ -184,7 +195,15 @@ router.post('/chat/completions', async (req, res) => {
 
         response.data.on('end', () => {
           clearInterval(keepaliveTimer);
-          console.log(`[Router] 🏁 Стрім завершено: ${actualModelPath} | bytes=${bytesReceived}`);
+          const totalMs = Date.now() - streamStart;
+          const upstreamKBs = totalMs > 0 ? ((bytesReceived / 1024) / (totalMs / 1000)).toFixed(1) : '?';
+          console.log(
+            `[Router] 🏁 ${actualModelPath}`,
+            `| ${(bytesReceived/1024).toFixed(1)}KB в ${chunkCount} chunks за ${totalMs}ms`,
+            `| upstream: ${upstreamKBs} KB/s`,
+            `| TTFB-body: ${firstChunkAt}ms`,
+            `| max-gap: ${maxGapMs}ms`
+          );
           if (!res.writableEnded) {
             if (adapter.flushBuffer) adapter.flushBuffer(res, config);
             res.end();
