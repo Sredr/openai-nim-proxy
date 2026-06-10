@@ -28,7 +28,9 @@ function setStreamHeaders(res) {
   res.setHeader('Cache-Control', 'no-cache');
   res.setHeader('Connection', 'keep-alive');
   res.setHeader('X-Accel-Buffering', 'no'); // ← КРИТИЧНО для Render/nginx
-  if (res.flush) res.flush();
+  // res.flush() тут не викликаємо — Node.js HTTP responses мають Nagle disabled
+  // за замовчуванням, тому write() одразу йде в мережу без буферизації.
+  // Надмірний flush() лише збільшує кількість дрібних TCP-пакетів.
 }
 
 // ── KEEPALIVE для thinking-моделей ───────────────────────────────────────────
