@@ -1,21 +1,18 @@
+const { StringDecoder } = require('string_decoder');
+
 // ── SSE Line Buffer ──────────────────────────────────────────────────────────
-// Проблема: Axios (і будь-який TCP стек) нарізає upstream-відповідь на довільні
-// шматки (~256–4096 байт). Один SSE-рядок "data: {...}\n\n" може прийти як:
-//   chunk1: 'data: {"choices":[{"delta":{"con'
-//   chunk2: 'tent":"Hello world"}}]}\n\n'
-// Стара логіка робила split('\n') на кожен chunk і намагалась парсити неповні
-// рядки — вони або ігнорувались, або давали помилку JSON.parse.
+// Проблема 1 (швидкість): Axios нарізає upstream-відповідь на довільні TCP chunks.
+// Один SSE-рядок "data: {...}\n\n" може прийти як кілька окремих data-events.
+// Стара логіка: split('\n') на кожен chunk → неповні рядки ігнорувались.
+// Нова логіка: буфер накопичує текст і обробляє тільки повні \n\n-події.
 //
-// Рішення: SSE-буфер накопичує сирий текст і відпрацьовує тільки ПОВНІ події
-// (рядки до \n\n). Неповні залишаються в буфері до наступного chunk.
-//
-// ВАЖЛИВО про flush():
-// res.flush() — це метод compression-middleware (наприклад, express-compression).
-// Без compression middleware — його взагалі немає (res.flush === undefined).
-// Навіть якщо є — викликати його після кожного write() контрпродуктивно:
-// Node.js і так надсилає write() без затримок (Nagle disabled for HTTP responses).
-// Частий flush() лише додає syscall overhead і збільшує кількість TCP-пакетів.
-// Ми його прибрали повністю.
+// Проблема 2 (знаки питання): Кирилиця = 2 байти на символ, emoji = 4 байти.
+// Якщо TCP chunk обрізає символ посередині, chunk.toString() → "?" або "▯".
+// StringDecoder утримує неповні байти між chunks і додає їх до наступного.
+// Приклад: "і" = [0xD1, 0x96]. Chunk закінчується на 0xD1 →
+//   chunk.toString()        → "?"           (ПОГАНО)
+//   decoder.write(chunk)    → ""            (затримали 0xD1)
+//   decoder.write(nextChunk)→ "і..."        (ДОБРЕ, 0xD1+0x96 = повний символ)
 
 function extractThoughtTags(text) {
   const match = text.match(/^<thought>[\s\S]*?<\/thought>/);
@@ -67,13 +64,11 @@ function processSseLine(jsonStr, res, config) {
   try {
     parsed = JSON.parse(jsonStr);
   } catch {
-    // Неповалідний JSON — пропускаємо (upstream іноді надсилає comment-рядки)
     return;
   }
 
   const delta = parsed.choices?.[0]?.delta;
 
-  // Якщо немає delta або немає content — пропускаємо або форвардимо як є
   if (!delta || delta.content == null) {
     res.write(`data: ${JSON.stringify(parsed)}\n\n`);
     return;
@@ -82,7 +77,6 @@ function processSseLine(jsonStr, res, config) {
   let content = String(delta.content || '');
   if (res.isThinking === undefined) res.isThinking = false;
 
-  // State machine для <thought>...</thought> тегів (thinking моделі NIM)
   while (content.length > 0) {
     if (!res.isThinking) {
       const startIdx = content.indexOf('<thought>');
@@ -128,31 +122,46 @@ module.exports = {
   formatReq: (body, model) => ({ ...body, model }),
   formatRes: (data, config) => cleanResponse(data, config),
 
-  // parseStream викликається з chat.js на кожен TCP chunk від upstream.
-  // Ми НЕ парсимо chunk одразу — накопичуємо в res._sseBuffer до повного рядка.
   parseStream: (chunk, res, config) => {
-    // Ініціалізація буфера на перший виклик
-    if (res._sseBuffer === undefined) res._sseBuffer = '';
+    if (res._sseBuffer === undefined) {
+      res._sseBuffer = '';
+      // StringDecoder буферизує неповні multi-byte UTF-8 між chunks
+      res._sseDecoder = new StringDecoder('utf8');
+    }
 
-    res._sseBuffer += chunk.toString();
+    // decoder.write() повертає тільки повні UTF-8 символи,
+    // неповний хвіст тримає всередині до наступного chunk
+    res._sseBuffer += res._sseDecoder.write(chunk);
 
-    // SSE-події розділяються подвійним переносом рядка \n\n
-    // Розбиваємо буфер на повні події
     const events = res._sseBuffer.split('\n\n');
-
-    // Останній елемент після split — або пустий рядок (якщо chunk закінчувався на \n\n)
-    // або неповний рядок що чекає на продовження. Залишаємо в буфері.
+    // Останній елемент — або '' або неповний рядок, залишаємо в буфері
     res._sseBuffer = events.pop() ?? '';
 
     for (const event of events) {
-      // Кожна подія може складатись з кількох рядків (multi-line SSE).
-      // Нас цікавлять тільки рядки "data: ..."
       for (const line of event.split('\n')) {
         const t = line.trim();
         if (t.startsWith('data: ')) {
           processSseLine(t.slice(6), res, config);
         }
-        // Рядки типу "event: ...", ": comment" — ігноруємо
+      }
+    }
+  },
+
+  // Викликається з chat.js в 'end' handler.
+  // Деякі провайдери не закінчують останній рядок на \n\n —
+  // без цього [DONE] або останній токен губиться.
+  flushBuffer: (res, config) => {
+    if (res._sseBuffer === undefined) return;
+    // decoder.end() повертає будь-які байти що залишились всередині decoder
+    const tail = res._sseDecoder ? res._sseDecoder.end() : '';
+    const remaining = (res._sseBuffer + tail).trim();
+    res._sseBuffer = '';
+    if (!remaining) return;
+
+    for (const line of remaining.split('\n')) {
+      const t = line.trim();
+      if (t.startsWith('data: ')) {
+        processSseLine(t.slice(6), res, config);
       }
     }
   }

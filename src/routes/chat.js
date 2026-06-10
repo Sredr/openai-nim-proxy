@@ -185,7 +185,10 @@ router.post('/chat/completions', async (req, res) => {
         response.data.on('end', () => {
           clearInterval(keepaliveTimer);
           console.log(`[Router] 🏁 Стрім завершено: ${actualModelPath} | bytes=${bytesReceived}`);
-          if (!res.writableEnded) res.end();
+          if (!res.writableEnded) {
+            if (adapter.flushBuffer) adapter.flushBuffer(res, config);
+            res.end();
+          }
         });
 
         response.data.on('error', (streamErr) => {
