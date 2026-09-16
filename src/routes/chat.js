@@ -3,7 +3,7 @@ const router = express.Router();
 const providersConfig = require('../../config/providers.json');
 const routerConfig = require('../../config/router.json');
 const adapters = require('../adapters');
-const { getKeyCandidates, markKeySuccess, markKeyFailure, handleError, trackEndpoint, trackProvider, registerOutcome, sendError, stats, config, httpAgent, httpsAgent } = require('../utils/helpers');
+const { getKeyCandidates, markKeySuccess, markKeyFailure, fetchWithRetry, handleError, trackEndpoint, trackProvider, registerOutcome, sendError, stats, config, httpAgent, httpsAgent } = require('../utils/helpers');
 
 function resolveModelChain(modelName, visited = new Set()) {
   if (visited.has(modelName)) return [];
@@ -197,7 +197,7 @@ router.post('/chat/completions', async (req, res) => {
             httpAgent,
             httpsAgent,
             signal: abortController.signal,
-          });
+          }, { providerName });
           markKeySuccess(providerName, apiKey);
           break;
         } catch (err) {
@@ -238,6 +238,17 @@ router.post('/chat/completions', async (req, res) => {
         let maxGapMs = 0;             // найбільша пауза між chunks (де upstream "думав")
         const streamStart = Date.now();
 
+        // Результат стріму фіксуємо РІВНО ОДИН раз: Node може віддати і 'end',
+        // і 'error' для одного обірваного потоку — без цього запис мав би
+        // одночасно +1 до success і +1 до failed.
+        let streamOutcomeRecorded = false;
+        const recordStreamOutcome = (err) => {
+          if (streamOutcomeRecorded) return;
+          streamOutcomeRecorded = true;
+          // Клієнт сам натиснув Stop — це не помилка проксі
+          if (!clientGone) registerOutcome(err, providerName);
+        };
+
         response.data.on('data', chunk => {
           const now = Date.now();
           const gap = now - lastChunkAt;
@@ -271,7 +282,7 @@ router.post('/chat/completions', async (req, res) => {
             res.end();
           }
           // Стрім дочитано до кінця — тільки тепер це справжній успіх
-          registerOutcome(null, providerName);
+          recordStreamOutcome(null);
         });
 
         response.data.on('error', (streamErr) => {
@@ -279,7 +290,7 @@ router.post('/chat/completions', async (req, res) => {
           console.error(`[Router] ❌ Помилка стріму від ${actualModelPath}:`, streamErr.message);
           // Обірваний посеред стріму потік — це помилка, а не успіх
           // (крім випадку, коли клієнт сам натиснув Stop — тоді це не наша помилка)
-          if (!clientGone) registerOutcome(streamErr, providerName);
+          recordStreamOutcome(streamErr);
           // Якщо заголовки вже відправлені — не можемо змінити статус.
           // Надсилаємо SSE-error щоб клієнт знав що стрім обірвався.
           if (!res.writableEnded) {

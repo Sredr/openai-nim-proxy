@@ -65,8 +65,8 @@ function buildAdminHtml() {
     <div class="stat"><div class="stat-val" id="sTotal">—</div><div class="stat-lbl">Всього запитів</div></div>
     <div class="stat"><div class="stat-val" id="sSuccess">—</div><div class="stat-lbl">Успішних</div></div>
     <div class="stat err"><div class="stat-val" id="sFailed">—</div><div class="stat-lbl">Невдач (фінальних)</div></div>
-    <div class="stat warn"><div class="stat-val" id="s429">—</div><div class="stat-lbl">429 rate limit</div></div>
-    <div class="stat err"><div class="stat-val" id="s5xx">—</div><div class="stat-lbl">5xx помилки</div></div>
+    <div class="stat warn"><div class="stat-val" id="s429">—</div><div class="stat-lbl">429 від upstream</div></div>
+    <div class="stat err"><div class="stat-val" id="s5xx">—</div><div class="stat-lbl">5xx від upstream</div></div>
     <div class="stat err"><div class="stat-val" id="s4xx">—</div><div class="stat-lbl">Інші 4xx</div></div>
     <div class="stat warn"><div class="stat-val" id="sNet">—</div><div class="stat-lbl">Таймаути + мережа</div></div>
     <div class="stat"><div class="stat-val" id="sRetries">—</div><div class="stat-lbl">Повторів / врятовано</div></div>
@@ -145,14 +145,15 @@ function buildAdminHtml() {
         $('sRetries').textContent = (s.retries ?? 0) + ' / ' + (s.retriedOk ?? 0);
         $('uptimeEl').textContent = 'Аптайм: ' + fmtUptime(s.uptimeMs);
 
-        // Чек цілісності: total = success + failed, а сума err* = failed.
-        // Якщо тут попередження — значить якийсь шлях запиту не фіксує результат.
+        // Чек цілісності: total = success + failed, сума failedByKind = failed,
+        // а помилок від upstream не менше за фінальні невдачі (решта — вилікувані ретраями).
         const failed = s.failed ?? 0;
         const sumErr = (s.err429??0)+(s.err5xx??0)+(s.errOther??0)+(s.errTimeout??0)+(s.errNetwork??0);
-        const okInv = (s.success + failed === s.total) && (sumErr === failed);
+        const sumKind = Object.values(s.failedByKind ?? {}).reduce((a, b) => a + b, 0);
+        const okInv = (s.success + failed === s.total) && (sumKind === failed) && (sumErr >= failed);
         $('integrityEl').textContent = okInv
-          ? '✓ Метрики сходяться: ' + s.success + ' + ' + failed + ' = ' + s.total
-          : '⚠️ Розбіжність: total ' + s.total + ' ≠ success ' + s.success + ' + failed ' + failed + ' (сума err* = ' + sumErr + ')';
+          ? '✓ Метрики сходяться: ' + s.success + ' + ' + failed + ' = ' + s.total + ' · вилікувано ретраями: ' + (sumErr - failed)
+          : '⚠️ Розбіжність: total ' + s.total + ' vs success ' + s.success + ' + failed ' + failed + ' (failedByKind = ' + sumKind + ', err* = ' + sumErr + ')';
         
         const ep = s.byEndpoint ?? {};
         const epKeys = Object.keys(ep);

@@ -33,15 +33,20 @@ const config = {
 };
 
 // ── Метрики ──────────────────────────────────────────────────────────────────
-// Два інваріанти, які адмінка перевіряє:
-//   1) total  = success + failed
-//   2) failed = err429 + err5xx + errOther + errTimeout + errNetwork
-// err* рахують ФІНАЛЬНИЙ результат запиту (а не кожну спробу ретраю),
-// тому суми завжди сходяться. Ретраї видно окремо в retries/retriedOk.
+// Дві різні речі, які легко переплутати:
+//   • err*   — ФАКТИ помилок від upstream (кожна спроба, разом із тими, що
+//              вдалось вилікувати ретраєм). Саме це власник хоче бачити:
+//              «429 rate limit» більше не показує 0, коли провайдер лімітує.
+//   • failed — фінальні невдачі запитів (те, що клієнт реально отримав як помилку).
+// Інваріанти, які перевіряє адмінка:
+//   1) total = success + failed
+//   2) сума failedByKind = failed
+//   3) сума err* >= failed  (різниця = помилки, вилікувані ретраями)
 const stats = {
   total: 0, success: 0, failed: 0,
   retries: 0, retriedOk: 0,
   err429: 0, err5xx: 0, errOther: 0, errTimeout: 0, errNetwork: 0,
+  failedByKind: {},
   byEndpoint: {},
   byProvider: {},
   errorsByProvider: {},
@@ -81,6 +86,10 @@ async function fetchWithRetry(axiosConfig, opts = {}) {
     } catch (err) {
       // Клієнт відключився (Stop у клієнті, закрита вкладка) — не молотимо далі
       if (signal?.aborted || err.code === 'ERR_CANCELED') throw err;
+
+      // Кожна помилка від upstream потрапляє в статистику одразу — навіть якщо
+      // наступний ретрай її вилікує (інакше 429 від провайдера були б невидні)
+      countUpstreamError(err, opts.providerName);
 
       const status = err.response?.status;
       const retryAfterMs = (parseInt(err.response?.headers?.['retry-after'] ?? '0') * 1000) || config.retry429DelayMs;
@@ -137,23 +146,38 @@ const ERROR_FIELD_BY_KIND = {
   other: 'errOther',
 };
 
-// Єдина точка фіксації РЕЗУЛЬТАТУ запиту — саме тому інваріант total = success + failed
-// тепер тримається (раніше stats.success++ стояв у кількох місцях, а помилки
-// у chat-роуті не рахувались узагалі).
-function registerOutcome(err, providerName) {
-  if (err == null) {
-    stats.success++;
-    return 'success';
-  }
-
+// Рахує ФАКТ помилки від upstream — викликається в момент спостереження
+// (у fetchWithRetry на кожній спробі, у стрімі, у ранніх відмовах).
+// Флаг __counted гарантує, що одна й та сама помилка не порахується двічі
+// (наприклад, у fetchWithRetry і потім у handleError).
+function countUpstreamError(err, providerName) {
+  if (err == null) return null;
   const kind = errorKindOf(err);
-  stats.failed++;
+  if (err.__counted) return kind;
+  err.__counted = true;
+
   stats[ERROR_FIELD_BY_KIND[kind]]++;
 
   if (providerName) {
     const byProvider = stats.errorsByProvider[providerName] ?? (stats.errorsByProvider[providerName] = {});
     byProvider[kind] = (byProvider[kind] ?? 0) + 1;
   }
+
+  return kind;
+}
+
+// Єдина точка фіксації РЕЗУЛЬТАТУ запиту для клієнта — саме тому інваріант
+// total = success + failed тепер тримається (раніше stats.success++ стояв у
+// кількох місцях, а помилки у chat-роуті не рахувались узагалі).
+function registerOutcome(err, providerName) {
+  if (err == null) {
+    stats.success++;
+    return 'success';
+  }
+
+  const kind = countUpstreamError(err, providerName);
+  stats.failed++;
+  stats.failedByKind[kind] = (stats.failedByKind[kind] ?? 0) + 1;
 
   return kind;
 }
@@ -345,7 +369,7 @@ function handleError(err, res, providerName) {
 
 module.exports = {
   config, stats, trackEndpoint, trackProvider,
-  fetchWithRetry, extractApiKey, handleError, errorKindOf, registerOutcome, sendError,
+  fetchWithRetry, extractApiKey, handleError, errorKindOf, registerOutcome, countUpstreamError, sendError,
   getKeyCandidates, markKeyUsed, markKeySuccess, markKeyFailure, getKeyPoolSnapshot,
   httpAgent, httpsAgent,
 };
