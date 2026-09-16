@@ -1,10 +1,9 @@
 const express = require('express');
-const axios = require('axios');
 const router = express.Router();
 const providersConfig = require('../../config/providers.json');
 const routerConfig = require('../../config/router.json');
 const adapters = require('../adapters');
-const { extractApiKey, handleError, trackEndpoint, trackProvider, registerOutcome, sendError, stats, config, httpAgent, httpsAgent } = require('../utils/helpers');
+const { getKeyCandidates, markKeySuccess, markKeyFailure, handleError, trackEndpoint, trackProvider, registerOutcome, sendError, stats, config, httpAgent, httpsAgent } = require('../utils/helpers');
 
 function resolveModelChain(modelName, visited = new Set()) {
   if (visited.has(modelName)) return [];
@@ -82,6 +81,17 @@ router.post('/chat/completions', async (req, res) => {
 
   let lastError = null;
 
+  // Скасовуємо активні спроби, якщо клієнт відключився (Stop у клієнті,
+  // закрита вкладка) — інакше ретраї молотять провайдера даремно.
+  const abortController = new AbortController();
+  let clientGone = false;
+  res.on('close', () => {
+    if (!res.writableEnded) {
+      clientGone = true;
+      abortController.abort();
+    }
+  });
+
   // Провайдер, на якому зупинився ланцюжок — потрібен для статистики помилок по провайдерах
   let lastProviderName = 'nvidia';
 
@@ -107,22 +117,19 @@ router.post('/chat/completions', async (req, res) => {
 
       const provider = providersConfig[providerName] || providersConfig['nvidia'];
       lastProviderName = providerName;
-      const apiKey = extractApiKey(req, providerName);
 
-      console.log(`[Router] 🔑 apiKey для ${providerName}:`, apiKey ? apiKey.slice(0, 8) + '...' : 'null');
+      // ── Ключі: черга кандидатів замість одного ключа ─────────────────────
+      // Ключі в cooldown/бані переміщуються в кінець черги, тому проблемний
+      // ключ більше не «зʼїдає» запит — пробуємо наступний.
+      const candidates = getKeyCandidates(req, providerName).slice(0, Math.max(1, config.maxKeyAttempts));
 
-      if (!apiKey) { 
+      if (candidates.length === 0) { 
         console.warn(`[Router] ⚠️ Ключ відсутній для ${providerName}. Повертаю 401.`); 
         return sendError(res, 401, `API ключ для ${providerName} не знайдено`, providerName);
       }
       
-      if (typeof apiKey === 'string' && (apiKey === 'nvapi-' || apiKey.endsWith('-') || apiKey.trim().length < 10)) { 
-        console.warn(`[Router] ⚠️ Невірний ключ для ${providerName}. Повертаю 401.`); 
-        return sendError(res, 401, `Невірний API ключ для ${providerName}`, providerName);
-      }
-      
       trackProvider(providerName);
-      console.log(`[Router] ➡️ Направляю на: ${providerName} | Модель: ${pureModelName} | stream=${isStream}`);
+      console.log(`[Router] ➡️ Направляю на: ${providerName} | Модель: ${pureModelName} | stream=${isStream} | ключів у черзі: ${candidates.length}`);
 
       const adapter = adapters[provider.type] || adapters.openai;
       const requestBody = adapter.formatReq(req.body, pureModelName);
@@ -135,15 +142,9 @@ router.post('/chat/completions', async (req, res) => {
       if (baseUrl.includes('{CLOUDFLARE_ACCOUNT_ID}')) {
         baseUrl = baseUrl.replace('{CLOUDFLARE_ACCOUNT_ID}', process.env.CLOUDFLARE_ACCOUNT_ID || '');
       }
-
-      let reqUrl = `${baseUrl}/chat/completions`;
-      const headers = { 'Content-Type': 'application/json' };
-
-      if (provider.type === 'gemini') {
-        reqUrl = `${baseUrl}/${pureModelName}:generateContent?key=${apiKey}`;
-      } else {
-        headers['Authorization'] = `Bearer ${apiKey}`;
-      }
+      // Тестова «щілина»: у тестах upstream підмінюється локальним фейком.
+      // У проді змінна не задана, тому поведінка не змінюється.
+      if (process.env.TEST_UPSTREAM_BASE) baseUrl = process.env.TEST_UPSTREAM_BASE;
 
       // ── ТАЙМАУТИ ──────────────────────────────────────────────────────────
       // Axios timeout для stream — це таймаут на з'єднання + перший байт даних
@@ -160,17 +161,66 @@ router.post('/chat/completions', async (req, res) => {
         : config.timeoutMs;                          // 85с для звичайних запитів
 
       const t0 = Date.now();
+      let response = null;
+      let keyError = null;
 
-      const response = await axios({
-        method: 'post',
-        url: reqUrl,
-        data: requestBody,
-        headers,
-        responseType: isStream ? 'stream' : 'json',
-        timeout: connectTimeoutMs,
-        httpAgent,
-        httpsAgent,
-      });
+      // ── Перебір ключів ───────────────────────────────────────────────────
+      // fetchWithRetry робить ретраї на 429/5xx/мережеві помилки для ОДНОГО ключа,
+      // а тут ми перемикаємось на наступний ключ, якщо поточний «зіпсований».
+      for (const candidate of candidates) {
+        const apiKey = candidate.value;
+
+        if (typeof apiKey === 'string' && (apiKey === 'nvapi-' || apiKey.endsWith('-') || apiKey.trim().length < 10)) {
+          console.warn(`[Router] ⚠️ Ключ для ${providerName} виглядає невалідним — пробую наступний`);
+          markKeyFailure(providerName, apiKey, 401);
+          keyError = Object.assign(new Error(`Невірний API ключ для ${providerName}`), { response: { status: 401 } });
+          continue;
+        }
+
+        let reqUrl = `${baseUrl}/chat/completions`;
+        const headers = { 'Content-Type': 'application/json' };
+
+        if (provider.type === 'gemini') {
+          reqUrl = `${baseUrl}/${pureModelName}:generateContent?key=${apiKey}`;
+        } else {
+          headers['Authorization'] = `Bearer ${apiKey}`;
+        }
+
+        try {
+          response = await fetchWithRetry({
+            method: 'post',
+            url: reqUrl,
+            data: requestBody,
+            headers,
+            responseType: isStream ? 'stream' : 'json',
+            timeout: connectTimeoutMs,
+            httpAgent,
+            httpsAgent,
+            signal: abortController.signal,
+          });
+          markKeySuccess(providerName, apiKey);
+          break;
+        } catch (err) {
+          // Клієнт відключився — не продовжуємо спроби
+          if (abortController.signal.aborted) throw err;
+
+          const status = err.response?.status;
+          const retryAfterMs = parseInt(err.response?.headers?.['retry-after'] ?? '0') * 1000;
+          const verdict = markKeyFailure(providerName, apiKey, status, retryAfterMs);
+          lastError = err;
+
+          // Проблема не в ключі (5xx/мережа/таймаут/4xx) — не палимо інші ключі,
+          // а йдемо на наступну модель у ланцюжку
+          if (verdict === 'untouched') throw err;
+
+          keyError = err;
+          console.warn(`[Router] 🔑 ${providerName}: ключ відхилено (HTTP ${status ?? err.code}) → ${verdict}, пробую наступний ключ`);
+        }
+      }
+
+      if (!response) {
+        throw keyError ?? new Error(`Жоден ключ для ${providerName} не спрацював`);
+      }
 
       const ttfb = Date.now() - t0;
       console.log(`[Router] ✅ Відповідь від: ${actualModelPath} | TTFB: ${ttfb}ms`);
@@ -228,7 +278,8 @@ router.post('/chat/completions', async (req, res) => {
           clearInterval(keepaliveTimer);
           console.error(`[Router] ❌ Помилка стріму від ${actualModelPath}:`, streamErr.message);
           // Обірваний посеред стріму потік — це помилка, а не успіх
-          registerOutcome(streamErr, providerName);
+          // (крім випадку, коли клієнт сам натиснув Stop — тоді це не наша помилка)
+          if (!clientGone) registerOutcome(streamErr, providerName);
           // Якщо заголовки вже відправлені — не можемо змінити статус.
           // Надсилаємо SSE-error щоб клієнт знав що стрім обірвався.
           if (!res.writableEnded) {
@@ -267,12 +318,22 @@ router.post('/chat/completions', async (req, res) => {
         isNetwork ? '(мережева помилка)' : ''
       );
 
-      // 400/401 — не пробуємо далі (неправильний запит або ключ)
-      if (status === 400 || status === 401) break;
+      // 400 — невалідний запит, повторювати на іншій моделі марно.
+      // 401 більше НЕ обриває ланцюжок: ключі вже перебрані вище, тож має сенс
+      // спробувати іншого провайдера з власним ключем.
+      if (status === 400) break;
+      // Клієнт сам відключився — далі пробувати немає сенсу
+      if (clientGone) break;
       // Таймаут при стрімі — пробуємо наступну модель
       // (інші помилки теж продовжують chain)
     }
   }
+  // Клієнт відключився ще до відповіді — нема кому відповідати і нема що рахувати
+  if (clientGone) {
+    console.log('[Router] 🚫 Клієнт відключився, результат не зараховуємо');
+    return;
+  }
+
   handleError(lastError || new Error("Всі моделі в ланцюжку недоступні"), res, lastProviderName);
 });
 
