@@ -74,6 +74,7 @@ function startServer(env) {
       goodkey: [200],           // ключ, який працює
       slowkey: ['stream-abort'],// стрім, що обривається посеред відповіді
       'slow-key': ['stream-abort'],
+      'stream-key': ['stream-ok'],
       flaky: [429, 200],        // 429 → ретрай → 200
       broken: [503],            // 5xx назавжди
     },
@@ -149,6 +150,20 @@ function startServer(env) {
 
       assert(after.success === before.success, 'обірваний стрім зарахували як успіх');
       assert(after.failed === before.failed + 1, 'обірваний стрім не зарахували як помилку');
+    });
+
+    await runCase('успішний стрім доходить до клієнта і рахується як успіх', async () => {
+      const before = await getStats();
+      const res = await chat(MODEL, auth(['stream-key-000001']), { stream: true });
+      await new Promise(r => setTimeout(r, 150));
+      const after = await getStats();
+
+      assert(res.status === 200, `очікували 200, отримали ${res.status}`);
+      assert(res.body.includes('hello') && res.body.includes('world'),
+        `стрім не дійшов повністю: ${JSON.stringify(res.body.slice(0, 120))}`);
+      assert(res.body.includes('[DONE]'), 'немає завершального [DONE]');
+      assert(after.success === before.success + 1, 'успішний стрім не порахований як успіх');
+      assert(after.failed === before.failed, 'успішний стрім помилково порахований як невдача');
     });
 
     await runCase('429 на ключі -> перемикання на наступний ключ', async () => {

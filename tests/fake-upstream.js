@@ -66,6 +66,23 @@ function startFakeUpstream(options = {}) {
         return;
       }
 
+      // Успішний SSE-стрім — основний продовий шлях (перевіряємо, що після
+      // змін у фіксації результату він досі доходить до клієнта повністю)
+      if (step === 'stream-ok') {
+        res.writeHead(200, {
+          'Content-Type': 'text/event-stream',
+          'Cache-Control': 'no-cache',
+          'Connection': 'keep-alive',
+        });
+        res.write('data: {"choices":[{"delta":{"role":"assistant","content":"hello"}}]}\n\n');
+        setTimeout(() => {
+          res.write('data: {"choices":[{"delta":{"content":" world"}}]}\n\n');
+          res.write('data: [DONE]\n\n');
+          res.end();
+        }, 30);
+        return;
+      }
+
       // Числовий крок = HTTP-статус помилки
       const headers = { 'Content-Type': 'application/json' };
       if (step === 429) headers['Retry-After'] = options.retryAfter ?? '0';
