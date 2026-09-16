@@ -2,7 +2,7 @@ const express = require('express');
 const multer = require('multer');
 const FormData = require('form-data');
 const router = express.Router();
-const { extractApiKey, handleError, trackEndpoint, fetchWithRetry, stats, config } = require('../utils/helpers');
+const { extractApiKey, handleError, trackEndpoint, fetchWithRetry, registerOutcome, sendError, stats, config } = require('../utils/helpers');
 
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 25 * 1024 * 1024 } });
 const NIM_API_BASE = 'https://integrate.api.nvidia.com/v1';
@@ -27,7 +27,7 @@ function toIntegrateBody(body) {
 
 router.post('/images/generations', async (req, res) => {
   const apiKey = extractApiKey(req);
-  if (!apiKey) return res.status(401).json({ error: { message: 'Відсутній API ключ', code: 401 } });
+  if (!apiKey) return sendError(res, 401, 'Відсутній API ключ', 'nvidia');
   stats.total++; trackEndpoint('POST /v1/images/generations');
   const model = String(req.body.model).trim();
 
@@ -49,8 +49,8 @@ router.post('/images/generations', async (req, res) => {
         result = data?.data ? data : { created: Math.floor(Date.now() / 1000), data: (data?.artifacts ?? []).map(a => ({ b64_json: a.base64 ?? a.b64_json ?? '' })) };
       } else throw e;
     }
-    stats.success++; res.json(result);
-  } catch (err) { handleError(err, res); }
+    registerOutcome(null, 'nvidia'); res.json(result);
+  } catch (err) { handleError(err, res, 'nvidia'); }
 });
 
 router.post('/audio/transcriptions', upload.single('file'), async (req, res) => {
@@ -65,8 +65,8 @@ router.post('/audio/transcriptions', upload.single('file'), async (req, res) => 
       method: 'post', url: `${NIM_API_BASE}/audio/transcriptions`, data: form,
       headers: { 'Authorization': `Bearer ${apiKey}`, ...form.getHeaders() }, timeout: config.timeoutMs,
     });
-    stats.success++; res.json(r.data);
-  } catch (err) { handleError(err, res); }
+    registerOutcome(null, 'nvidia'); res.json(r.data);
+  } catch (err) { handleError(err, res, 'nvidia'); }
 });
 
 module.exports = router;

@@ -1,7 +1,7 @@
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
-const { stats, trackEndpoint, fetchWithRetry, extractApiKey, handleError, config } = require('./src/utils/helpers');
+const { stats, trackEndpoint, fetchWithRetry, extractApiKey, handleError, registerOutcome, sendError, config } = require('./src/utils/helpers');
 
 const chatRoutes = require('./src/routes/chat');
 const mediaRoutes = require('./src/routes/media');
@@ -42,7 +42,7 @@ app.all('/v1/*', async (req, res) => {
   
   const apiKey = extractApiKey(req);
   if (!apiKey) {
-    return res.status(401).json({ error: { message: 'Відсутній API ключ', code: 401 } });
+    return sendError(res, 401, 'Відсутній API ключ', 'nvidia');
   }
 
   try {
@@ -55,7 +55,7 @@ app.all('/v1/*', async (req, res) => {
       responseType: isStream ? 'stream' : 'json',
       timeout: config.timeoutMs,
     });
-    stats.success++;
+    registerOutcome(null, 'nvidia');
     
     if (isStream) {
       res.setHeader('Content-Type', response.headers['content-type'] ?? 'text/event-stream');
@@ -69,7 +69,7 @@ app.all('/v1/*', async (req, res) => {
       res.status(response.status).json(response.data);
     }
   } catch (err) { 
-    handleError(err, res); 
+    handleError(err, res, 'nvidia'); 
   }
 });
 

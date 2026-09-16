@@ -4,7 +4,7 @@ const router = express.Router();
 const providersConfig = require('../../config/providers.json');
 const routerConfig = require('../../config/router.json');
 const adapters = require('../adapters');
-const { extractApiKey, handleError, trackEndpoint, trackProvider, stats, config, httpAgent, httpsAgent } = require('../utils/helpers');
+const { extractApiKey, handleError, trackEndpoint, trackProvider, registerOutcome, sendError, stats, config, httpAgent, httpsAgent } = require('../utils/helpers');
 
 function resolveModelChain(modelName, visited = new Set()) {
   if (visited.has(modelName)) return [];
@@ -82,6 +82,9 @@ router.post('/chat/completions', async (req, res) => {
 
   let lastError = null;
 
+  // Провайдер, на якому зупинився ланцюжок — потрібен для статистики помилок по провайдерах
+  let lastProviderName = 'nvidia';
+
   for (const actualModelPath of modelChain) {
     let keepaliveTimer = null;
 
@@ -103,18 +106,19 @@ router.post('/chat/completions', async (req, res) => {
       }
 
       const provider = providersConfig[providerName] || providersConfig['nvidia'];
+      lastProviderName = providerName;
       const apiKey = extractApiKey(req, providerName);
 
       console.log(`[Router] 🔑 apiKey для ${providerName}:`, apiKey ? apiKey.slice(0, 8) + '...' : 'null');
 
       if (!apiKey) { 
         console.warn(`[Router] ⚠️ Ключ відсутній для ${providerName}. Повертаю 401.`); 
-        return res.status(401).json({ error: { message: `API ключ для ${providerName} не знайдено`, code: 401 } });
+        return sendError(res, 401, `API ключ для ${providerName} не знайдено`, providerName);
       }
       
       if (typeof apiKey === 'string' && (apiKey === 'nvapi-' || apiKey.endsWith('-') || apiKey.trim().length < 10)) { 
         console.warn(`[Router] ⚠️ Невірний ключ для ${providerName}. Повертаю 401.`); 
-        return res.status(401).json({ error: { message: `Невірний API ключ для ${providerName}`, code: 401 } });
+        return sendError(res, 401, `Невірний API ключ для ${providerName}`, providerName);
       }
       
       trackProvider(providerName);
@@ -168,7 +172,6 @@ router.post('/chat/completions', async (req, res) => {
         httpsAgent,
       });
 
-      stats.success++;
       const ttfb = Date.now() - t0;
       console.log(`[Router] ✅ Відповідь від: ${actualModelPath} | TTFB: ${ttfb}ms`);
 
@@ -217,11 +220,15 @@ router.post('/chat/completions', async (req, res) => {
             if (adapter.flushBuffer) adapter.flushBuffer(res, config);
             res.end();
           }
+          // Стрім дочитано до кінця — тільки тепер це справжній успіх
+          registerOutcome(null, providerName);
         });
 
         response.data.on('error', (streamErr) => {
           clearInterval(keepaliveTimer);
           console.error(`[Router] ❌ Помилка стріму від ${actualModelPath}:`, streamErr.message);
+          // Обірваний посеред стріму потік — це помилка, а не успіх
+          registerOutcome(streamErr, providerName);
           // Якщо заголовки вже відправлені — не можемо змінити статус.
           // Надсилаємо SSE-error щоб клієнт знав що стрім обірвався.
           if (!res.writableEnded) {
@@ -242,6 +249,7 @@ router.post('/chat/completions', async (req, res) => {
       } else {
         const finalData = adapter.formatRes(response.data, config);
         res.json(finalData);
+        registerOutcome(null, providerName);
       }
       return; 
 
@@ -265,7 +273,7 @@ router.post('/chat/completions', async (req, res) => {
       // (інші помилки теж продовжують chain)
     }
   }
-  handleError(lastError || new Error("Всі моделі в ланцюжку недоступні"), res);
+  handleError(lastError || new Error("Всі моделі в ланцюжку недоступні"), res, lastProviderName);
 });
 
 module.exports = router;

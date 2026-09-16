@@ -64,14 +64,24 @@ function buildAdminHtml() {
   <div class="stats" id="statsGrid">
     <div class="stat"><div class="stat-val" id="sTotal">—</div><div class="stat-lbl">Всього запитів</div></div>
     <div class="stat"><div class="stat-val" id="sSuccess">—</div><div class="stat-lbl">Успішних</div></div>
+    <div class="stat err"><div class="stat-val" id="sFailed">—</div><div class="stat-lbl">Невдач (фінальних)</div></div>
     <div class="stat warn"><div class="stat-val" id="s429">—</div><div class="stat-lbl">429 rate limit</div></div>
     <div class="stat err"><div class="stat-val" id="s5xx">—</div><div class="stat-lbl">5xx помилки</div></div>
+    <div class="stat err"><div class="stat-val" id="s4xx">—</div><div class="stat-lbl">Інші 4xx</div></div>
+    <div class="stat warn"><div class="stat-val" id="sNet">—</div><div class="stat-lbl">Таймаути + мережа</div></div>
+    <div class="stat"><div class="stat-val" id="sRetries">—</div><div class="stat-lbl">Повторів / врятовано</div></div>
   </div>
   <div class="uptime" id="uptimeEl"></div>
+  <div class="uptime" id="integrityEl"></div>
   
   <div class="card">
     <div class="card-title">🏢 Запити по провайдерах</div>
     <div class="ep-grid" id="provGrid"><div class="ep-name" style="color:#444">Поки немає даних</div><div></div></div>
+  </div>
+
+  <div class="card">
+    <div class="card-title">⚠️ Помилки по провайдерах</div>
+    <div class="ep-grid" id="errProvGrid"><div class="ep-name" style="color:#444">Помилок не зафіксовано</div><div></div></div>
   </div>
 
   <div class="card">
@@ -128,8 +138,21 @@ function buildAdminHtml() {
       try {
         const s = await fetch('/admin/stats').then(r=>r.json());
         $('sTotal').textContent = s.total; $('sSuccess').textContent = s.success;
+        $('sFailed').textContent = s.failed ?? 0;
         $('s429').textContent = s.err429; $('s5xx').textContent = s.err5xx;
+        $('s4xx').textContent = s.errOther ?? 0;
+        $('sNet').textContent = (s.errTimeout ?? 0) + (s.errNetwork ?? 0);
+        $('sRetries').textContent = (s.retries ?? 0) + ' / ' + (s.retriedOk ?? 0);
         $('uptimeEl').textContent = 'Аптайм: ' + fmtUptime(s.uptimeMs);
+
+        // Чек цілісності: total = success + failed, а сума err* = failed.
+        // Якщо тут попередження — значить якийсь шлях запиту не фіксує результат.
+        const failed = s.failed ?? 0;
+        const sumErr = (s.err429??0)+(s.err5xx??0)+(s.errOther??0)+(s.errTimeout??0)+(s.errNetwork??0);
+        const okInv = (s.success + failed === s.total) && (sumErr === failed);
+        $('integrityEl').textContent = okInv
+          ? '✓ Метрики сходяться: ' + s.success + ' + ' + failed + ' = ' + s.total
+          : '⚠️ Розбіжність: total ' + s.total + ' ≠ success ' + s.success + ' + failed ' + failed + ' (сума err* = ' + sumErr + ')';
         
         const ep = s.byEndpoint ?? {};
         const epKeys = Object.keys(ep);
@@ -140,6 +163,16 @@ function buildAdminHtml() {
         const pKeys = Object.keys(prov);
         if (pKeys.length) $('provGrid').innerHTML = pKeys.sort((a,b)=>prov[b]-prov[a]).map(k =>
           \`<div class="ep-name">\${k}</div><div class="ep-cnt">\${prov[k]}</div>\`).join('');
+        const errProv = s.errorsByProvider ?? {};
+        const eKeys = Object.keys(errProv);
+        const sumOf = o => Object.values(o).reduce((a, b) => a + b, 0);
+        if (eKeys.length) $('errProvGrid').innerHTML = eKeys.sort((a,b)=>sumOf(errProv[b])-sumOf(errProv[a])).map(k => {
+          const parts = Object.entries(errProv[k]).map(e => e[0] + ':' + e[1]).join(' ');
+          return '<div class="ep-name">' + k + ' <span style="color:#666">(' + parts + ')</span></div>' +
+                 '<div class="ep-cnt" style="color:#ff4455">' + sumOf(errProv[k]) + '</div>';
+        }).join('');
+
+
 
       } catch {}
     }

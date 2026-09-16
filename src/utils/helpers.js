@@ -25,11 +25,19 @@ const config = {
   keepaliveIntervalMs:      parseInt(process.env.KEEPALIVE_INTERVAL_MS ?? '20000'),
 };
 
+// ── Метрики ──────────────────────────────────────────────────────────────────
+// Два інваріанти, які адмінка перевіряє:
+//   1) total  = success + failed
+//   2) failed = err429 + err5xx + errOther + errTimeout + errNetwork
+// err* рахують ФІНАЛЬНИЙ результат запиту (а не кожну спробу ретраю),
+// тому суми завжди сходяться. Ретраї видно окремо в retries/retriedOk.
 const stats = {
-  total: 0, success: 0,
-  err429: 0, err5xx: 0, errOther: 0,
+  total: 0, success: 0, failed: 0,
+  retries: 0, retriedOk: 0,
+  err429: 0, err5xx: 0, errOther: 0, errTimeout: 0, errNetwork: 0,
   byEndpoint: {},
   byProvider: {},
+  errorsByProvider: {},
   startTime: Date.now(),
 };
 
@@ -41,49 +49,118 @@ function trackProvider(name) {
   stats.byProvider[name] = (stats.byProvider[name] ?? 0) + 1;
 }
 
-async function fetchWithRetry(axiosConfig) {
+async function fetchWithRetry(axiosConfig, opts = {}) {
   // Додаємо keep-alive агенти до конфігу
   if (!axiosConfig.httpAgent && !axiosConfig.httpsAgent) {
     axiosConfig.httpAgent = httpAgent;
     axiosConfig.httpsAgent = httpsAgent;
   }
 
-  let attempts5xx = 0, attempts429 = 0;
+  const maxRetries = opts.maxRetries ?? config.maxRetries;
+  const max429Retries = opts.max429Retries ?? config.max429Retries;
+  const maxNetworkRetries = opts.maxNetworkRetries ?? config.maxRetries;
+  const signal = opts.signal ?? axiosConfig.signal;
+
+  let attempts5xx = 0, attempts429 = 0, attemptsNet = 0, retried = 0;
+  const sleep = ms => new Promise(r => setTimeout(r, ms));
+  const backoff = n => config.retryDelayMs * Math.pow(2, n - 1);
+
   while (true) {
     try {
-      return await axios(axiosConfig);
+      const response = await axios(axiosConfig);
+      // Запит вижив після повторів — видно, що ретраї реально працюють
+      if (retried > 0) stats.retriedOk++;
+      return response;
     } catch (err) {
+      // Клієнт відключився (Stop у клієнті, закрита вкладка) — не молотимо далі
+      if (signal?.aborted || err.code === 'ERR_CANCELED') throw err;
+
       const status = err.response?.status;
-      // ── 429 Rate Limit ───────────────────────────────────────────────────
-      if (status === 429 && attempts429 < config.max429Retries) {
-        attempts429++; stats.err429++;
-        const delay = (parseInt(err.response?.headers?.['retry-after'] ?? '0') * 1000) || config.retry429DelayMs;
-        console.log(`[429] Retry ${attempts429}/${config.max429Retries} через ${delay}ms`);
-        await new Promise(r => setTimeout(r, delay));
+      const retryAfterMs = (parseInt(err.response?.headers?.['retry-after'] ?? '0') * 1000) || config.retry429DelayMs;
+
+      // ── 429 Rate Limit (поважаємо Retry-After від провайдера) ────────────
+      if (status === 429 && attempts429 < max429Retries) {
+        attempts429++; retried++; stats.retries++;
+        console.log(`[429] Retry ${attempts429}/${max429Retries} через ${retryAfterMs}ms`);
+        await sleep(retryAfterMs);
         continue;
       }
       // ── 5xx Server Error ─────────────────────────────────────────────────
-      if (status != null && status >= 500 && attempts5xx < config.maxRetries) {
-        attempts5xx++; stats.err5xx++;
-        const delay = config.retryDelayMs * Math.pow(2, attempts5xx - 1);
-        console.log(`[${status}] Retry ${attempts5xx}/${config.maxRetries} через ${delay}ms`);
-        await new Promise(r => setTimeout(r, delay));
+      if (status != null && status >= 500 && attempts5xx < maxRetries) {
+        attempts5xx++; retried++; stats.retries++;
+        console.log(`[${status}] Retry ${attempts5xx}/${maxRetries} через ${backoff(attempts5xx)}ms`);
+        await sleep(backoff(attempts5xx));
         continue;
       }
       // ── Network / Timeout errors (status=undefined) ──────────────────────
       // ВАЖЛИВО: раніше тут був баг — `undefined >= 500` = false,
       // тому таймаути і мережеві помилки не ретраїлись ніколи.
-      const isRetryableNetworkErr = status == null && attempts5xx < config.maxRetries;
-      if (isRetryableNetworkErr) {
-        attempts5xx++;
-        const delay = config.retryDelayMs * Math.pow(2, attempts5xx - 1);
-        console.log(`[${err.code ?? 'NetworkError'}] Retry ${attempts5xx}/${config.maxRetries} через ${delay}ms`);
-        await new Promise(r => setTimeout(r, delay));
+      if (status == null && attemptsNet < maxNetworkRetries) {
+        attemptsNet++; retried++; stats.retries++;
+        console.log(`[${err.code ?? 'NetworkError'}] Retry ${attemptsNet}/${maxNetworkRetries} через ${backoff(attemptsNet)}ms`);
+        await sleep(backoff(attemptsNet));
         continue;
       }
       throw err;
     }
   }
+}
+
+// ── Класифікація помилок + фіксація результату запиту ────────────────────────
+// '429' | '5xx' | '4xx' | 'timeout' | 'network' | 'other'
+function errorKindOf(err) {
+  const status = err?.response?.status;
+  const code = err?.code;
+  if (status === 429) return '429';
+  if (status != null && status >= 500) return '5xx';
+  if (status != null && status >= 400) return '4xx';
+  if (code === 'ECONNABORTED' || code === 'ETIMEDOUT') return 'timeout';
+  if (code === 'ECONNRESET' || code === 'ENOTFOUND' || code === 'ECONNREFUSED'
+      || code === 'EHOSTUNREACH' || code === 'EAI_AGAIN' || code === 'ERR_CANCELED') return 'network';
+  if (status != null) return '4xx';
+  return 'other';
+}
+
+const ERROR_FIELD_BY_KIND = {
+  '429': 'err429',
+  '5xx': 'err5xx',
+  '4xx': 'errOther',
+  timeout: 'errTimeout',
+  network: 'errNetwork',
+  other: 'errOther',
+};
+
+// Єдина точка фіксації РЕЗУЛЬТАТУ запиту — саме тому інваріант total = success + failed
+// тепер тримається (раніше stats.success++ стояв у кількох місцях, а помилки
+// у chat-роуті не рахувались узагалі).
+function registerOutcome(err, providerName) {
+  if (err == null) {
+    stats.success++;
+    return 'success';
+  }
+
+  const kind = errorKindOf(err);
+  stats.failed++;
+  stats[ERROR_FIELD_BY_KIND[kind]]++;
+
+  if (providerName) {
+    const byProvider = stats.errorsByProvider[providerName] ?? (stats.errorsByProvider[providerName] = {});
+    byProvider[kind] = (byProvider[kind] ?? 0) + 1;
+  }
+
+  return kind;
+}
+
+// Ранні відмови (немає ключа, невалідний ключ, невалідна модель) теж мають
+// потрапляти у статистику — інакше такі запити «зникають» між total і success.
+function sendError(res, status, message, providerName) {
+  registerOutcome(Object.assign(new Error(message), { response: { status } }), providerName);
+  if (res && !res.headersSent) {
+    res.status(status).json({ error: { message, code: status } });
+  } else if (res && !res.writableEnded) {
+    res.end();
+  }
+  return status;
 }
 
 const PROVIDER_ORDER = ['nvidia', 'google', 'groq', 'openrouter', 'cloudflare', 'github', 'mistral', 'cohere', 'deepseek'];
@@ -140,7 +217,7 @@ function classifyError(err) {
   return code ?? 'Unknown Error';
 }
 
-function handleError(err, res) {
+function handleError(err, res, providerName) {
   const status = err.response?.status ?? 500;
   const rawData = err.response?.data;
   const errClass = classifyError(err);
@@ -150,9 +227,15 @@ function handleError(err, res) {
   else if (rawData?.error?.message) message = rawData.error.message;
   else if (typeof err.message === 'string') message = err.message;
 
-  if (status !== 429 && status < 500) stats.errOther++;
-  console.error(`[${errClass}]`, rawData !== undefined ? safeStringify(rawData) : `"${err.message}"`);
+  // Фінальний результат запиту — рахуємо і 429, і 5xx, і таймаути (раніше
+  // рахувались тільки 4xx≠429, тому дашборд показував нулі).
+  const kind = registerOutcome(err, providerName);
+  console.error(`[${errClass}${kind ? ` | ${kind}` : ''}]`, rawData !== undefined ? safeStringify(rawData) : `"${err.message}"`);
   if (res && !res.headersSent) res.status(status).json({ error: { message, code: status } });
 }
 
-module.exports = { config, stats, trackEndpoint, trackProvider, fetchWithRetry, extractApiKey, handleError, httpAgent, httpsAgent };
+module.exports = {
+  config, stats, trackEndpoint, trackProvider,
+  fetchWithRetry, extractApiKey, handleError, errorKindOf, registerOutcome, sendError,
+  httpAgent, httpsAgent,
+};
