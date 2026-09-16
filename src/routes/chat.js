@@ -163,63 +163,105 @@ router.post('/chat/completions', async (req, res) => {
       const t0 = Date.now();
       let response = null;
       let keyError = null;
+      let lastRetryAfterMs = 0;
+      let attemptsMade = 0;
 
-      // ── Перебір ключів ───────────────────────────────────────────────────
-      // fetchWithRetry робить ретраї на 429/5xx/мережеві помилки для ОДНОГО ключа,
-      // а тут ми перемикаємось на наступний ключ, якщо поточний «зіпсований».
-      for (const candidate of candidates) {
-        const apiKey = candidate.value;
+      // ── Круги по ключах при 429 ──────────────────────────────────────────
+      // 429 — це ліміт провайдера/моделі, а не провина ключа (буває «спільний»
+      // ліміт, який зникає будь-якої секунди). Тому:
+      //   • між ключами паузи НЕМАЄ — одразу йдемо на наступний ключ;
+      //   • пауза config.retry429DelayMs (3с) робиться МІЖ КРУГАМИ;
+      //   • ключ після 429 не блокується (лише позначається як щойно вживаний,
+      //     тому наступний запит почне з іншого ключа);
+      //   • 401/403 — реальна проблема ключа: ключ вимикається, беремо наступний;
+      //   • крутимо, доки не отримаємо відповідь, не вичерпаємо круги
+      //     (адмінка: «Кількість кругів при 429») або поки клієнт не відключився.
+      const rounds = Math.max(1, config.max429Retries || 1);
+      const retryDeadline = Date.now() + Math.max(config.retry429DelayMs, config.retry429MaxWaitMs);
 
-        if (typeof apiKey === 'string' && (apiKey === 'nvapi-' || apiKey.endsWith('-') || apiKey.trim().length < 10)) {
-          console.warn(`[Router] ⚠️ Ключ для ${providerName} виглядає невалідним — пробую наступний`);
-          markKeyFailure(providerName, apiKey, 401);
-          keyError = Object.assign(new Error(`Невірний API ключ для ${providerName}`), { response: { status: 401 } });
-          continue;
+      for (let round = 0; round < rounds && !response; round++) {
+        if (round > 0) {
+          // Пауза перед новим кругом. Retry-After провайдера поважаємо, але
+          // сумарно не даємо клієнту чекати більше retry429MaxWaitMs.
+          const waitMs = Math.max(config.retry429DelayMs, Math.min(lastRetryAfterMs, config.retry429MaxWaitMs));
+          if (Date.now() + waitMs > retryDeadline) {
+            console.log(`[Router] ⏱ Бюджет очікування на 429 вичерпано — припиняю круги на ${pureModelName}`);
+            break;
+          }
+          console.log(`[Router] ⏳ Круг ${round + 1}/${rounds} (ключів: ${candidates.length}) — пауза ${waitMs}ms`);
+          await new Promise(r => setTimeout(r, waitMs));
+          if (abortController.signal.aborted) break;
         }
 
-        let reqUrl = `${baseUrl}/chat/completions`;
-        const headers = { 'Content-Type': 'application/json' };
+        let attemptsThisRound = 0;
 
-        if (provider.type === 'gemini') {
-          reqUrl = `${baseUrl}/${pureModelName}:generateContent?key=${apiKey}`;
-        } else {
-          headers['Authorization'] = `Bearer ${apiKey}`;
+        for (const candidate of candidates) {
+          if (abortController.signal.aborted) break;
+          const apiKey = candidate.value;
+
+          if (typeof apiKey === 'string' && (apiKey === 'nvapi-' || apiKey.endsWith('-') || apiKey.trim().length < 10)) {
+            console.warn(`[Router] ⚠️ Ключ для ${providerName} виглядає невалідним — пробую наступний`);
+            markKeyFailure(providerName, apiKey, 401);
+            keyError = Object.assign(new Error(`Невірний API ключ для ${providerName}`), { response: { status: 401 } });
+            continue;
+          }
+
+          let reqUrl = `${baseUrl}/chat/completions`;
+          const headers = { 'Content-Type': 'application/json' };
+
+          if (provider.type === 'gemini') {
+            reqUrl = `${baseUrl}/${pureModelName}:generateContent?key=${apiKey}`;
+          } else {
+            headers['Authorization'] = `Bearer ${apiKey}`;
+          }
+
+          if (attemptsMade > 0) stats.retries++;   // кожна спроба після першої — повтор
+          attemptsMade++;
+          attemptsThisRound++;
+
+          try {
+            // max429Retries: 0 — 429 не ретраїмо всередині fetchWithRetry, щоб
+            // одразу перемкнутись на наступний ключ (крутить саме цей цикл)
+            response = await fetchWithRetry({
+              method: 'post',
+              url: reqUrl,
+              data: requestBody,
+              headers,
+              responseType: isStream ? 'stream' : 'json',
+              timeout: connectTimeoutMs,
+              httpAgent,
+              httpsAgent,
+              signal: abortController.signal,
+            }, { providerName, max429Retries: 0 });
+
+            if (attemptsMade > 1) stats.retriedOk++;
+            markKeySuccess(providerName, apiKey);
+            break;
+          } catch (err) {
+            // Клієнт відключився — не продовжуємо спроби
+            if (abortController.signal.aborted) throw err;
+
+            const status = err.response?.status;
+            lastRetryAfterMs = parseInt(err.response?.headers?.['retry-after'] ?? '0') * 1000;
+            const verdict = markKeyFailure(providerName, apiKey, status, lastRetryAfterMs);
+            lastError = err;
+
+            // Проблема не в ключі (5xx/мережа/таймаут/4xx) — не палимо інші
+            // ключі, а йдемо на наступну модель у ланцюжку
+            if (verdict === 'untouched') throw err;
+
+            // 429 (rate-limited) або 401/403 (disabled) → наступний ключ без паузи
+            keyError = err;
+            console.warn(`[Router] 🔑 ${providerName}: ключ відхилено (HTTP ${status ?? err.code}) → ${verdict}, беру наступний ключ`);
+          }
         }
 
-        try {
-          response = await fetchWithRetry({
-            method: 'post',
-            url: reqUrl,
-            data: requestBody,
-            headers,
-            responseType: isStream ? 'stream' : 'json',
-            timeout: connectTimeoutMs,
-            httpAgent,
-            httpsAgent,
-            signal: abortController.signal,
-          }, { providerName });
-          markKeySuccess(providerName, apiKey);
-          break;
-        } catch (err) {
-          // Клієнт відключився — не продовжуємо спроби
-          if (abortController.signal.aborted) throw err;
-
-          const status = err.response?.status;
-          const retryAfterMs = parseInt(err.response?.headers?.['retry-after'] ?? '0') * 1000;
-          const verdict = markKeyFailure(providerName, apiKey, status, retryAfterMs);
-          lastError = err;
-
-          // Проблема не в ключі (5xx/мережа/таймаут/4xx) — не палимо інші ключі,
-          // а йдемо на наступну модель у ланцюжку
-          if (verdict === 'untouched') throw err;
-
-          keyError = err;
-          console.warn(`[Router] 🔑 ${providerName}: ключ відхилено (HTTP ${status ?? err.code}) → ${verdict}, пробую наступний ключ`);
-        }
+        // Усі ключі виглядають невалідними — крутити далі немає сенсу
+        if (attemptsThisRound === 0) break;
       }
 
       if (!response) {
-        throw keyError ?? new Error(`Жоден ключ для ${providerName} не спрацював`);
+        throw keyError ?? new Error(`Жоден ключ для ${providerName} не спрацював за ${rounds} круг(ів)`);
       }
 
       const ttfb = Date.now() - t0;

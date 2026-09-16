@@ -11,8 +11,13 @@ const config = {
   enableThinking:           process.env.ENABLE_THINKING === 'true',
   maxRetries:               parseInt(process.env.MAX_RETRIES ?? '2'),
   retryDelayMs:             parseInt(process.env.RETRY_DELAY_MS ?? '1000'),
+  // Скільки КРУГІВ по ключах робити при 429 (керується з адмінки).
+  // Один ключ у .env → 3 круги = 3 спроби. Три ключі → 9 спроб (3 круги × 3 ключі).
   max429Retries:            parseInt(process.env.MAX_429_RETRIES ?? '3'),
-  retry429DelayMs:          parseInt(process.env.RETRY_429_DELAY_MS ?? '5000'),
+  // Пауза МІЖ КРУГАМИ при 429. Між ключами паузи немає — одразу йдемо на наступний.
+  retry429DelayMs:          parseInt(process.env.RETRY_429_DELAY_MS ?? '3000'),
+  // Максимальна пауза, яку беремо з Retry-After провайдера (щоб не вішати клієнта)
+  retry429MaxWaitMs:        parseInt(process.env.RETRY_429_MAX_WAIT_MS ?? '15000'),
   defaultTemperature:       parseFloat(process.env.DEFAULT_TEMPERATURE ?? '0.6'),
   defaultMaxTokens:         parseInt(process.env.DEFAULT_MAX_TOKENS ?? '2048'),
   // Таймаут для звичайних (non-stream) запитів
@@ -24,11 +29,10 @@ const config = {
   // Інтервал keepalive ping для Render (не більше 25с, бо Render вбиває за 30с idle)
   keepaliveIntervalMs:      parseInt(process.env.KEEPALIVE_INTERVAL_MS ?? '20000'),
   // ── Пул ключів ────────────────────────────────────────────────────────
-  // Скільки різних ключів максимум пробувати в межах одного запиту
+  // Скільки різних ключів максимум пробувати в межах одного кругу
   maxKeyAttempts:           parseInt(process.env.MAX_KEY_ATTEMPTS ?? '3'),
-  // Скільки тримати ключ у cooldown після 429 (якщо провайдер не дав Retry-After)
-  keyCooldownMs:            parseInt(process.env.KEY_COOLDOWN_MS ?? '30000'),
-  // На скільки вимикати ключ після 401/403 (невірний/відкликаний ключ)
+  // На скільки вимикати ключ після 401/403 (невірний/відкликаний ключ).
+  // УВАГА: 429 сюди не входить — це ліміт провайдера, а не проблема ключа.
   keyBanMs:                 parseInt(process.env.KEY_BAN_MS ?? '1800000'),
 };
 
@@ -195,14 +199,15 @@ function sendError(res, status, message, providerName) {
 }
 
 // ── Пул ключів зі станом ─────────────────────────────────────────────────────
-// Раніше тут була «сліпа» кругова ротація: ключ змінювався лише наступним
-// запитом, і ніхто не пам'ятав, що ключ щойно віддав 429 або 401. Тепер кожен
-// ключ має стан: cooldown після 429 і тимчасове вимкнення після 401/403.
+// Ключ має стан, але «штрафуємо» його ТІЛЬКИ за реальну проблему з ключем:
+//   • 401/403 — ключ невалідний/відкликаний → тимчасове вимкнення (keyBanMs);
+//   • 429     — це ліміт провайдера/моделі, а не провина ключа. Такий ключ не
+//               блокуємо: просто він стає «щойно використаним», тому наступний
+//               запит почне з іншого ключа (ротація по кругу), а в межах
+//               поточного запиту ключі перебираються по колу з паузою лише
+//               між кругами (див. chat.js).
 
-const KEY_LONG_COOLDOWN_MS = 5 * 60 * 1000;   // якщо ключ ловить 429 підряд
-const KEY_LONG_COOLDOWN_AFTER = 3;
-
-const keyPool = {};   // provider → Map(value → { failures, cooldownUntil, disabledUntil, lastUsedAt })
+const keyPool = {};   // provider → Map(value → { failures, disabledUntil, lastUsedAt })
 
 function getProviderKeys(providerName) {
   // Спробуємо спочатку plural версію (напр. GOOGLE_API_KEYS), потім singular
@@ -220,23 +225,20 @@ function getKeyState(providerName, value) {
   const pool = keyPool[providerName] ?? (keyPool[providerName] = new Map());
   let state = pool.get(value);
   if (!state) {
-    state = { value, failures: 0, cooldownUntil: 0, disabledUntil: 0, lastUsedAt: 0 };
+    state = { value, failures: 0, disabledUntil: 0, lastUsedAt: 0 };
     pool.set(value, state);
   }
   return state;
 }
 
-// 0 — ключ живий, 1 — у cooldown, 2 — вимкнений. Менший ранг = раніше в черзі.
+// 0 — ключ робочий, 2 — вимкнений (401/403). Менший ранг = раніше в черзі.
 function keyRank(state, now) {
-  if (state.disabledUntil > now) return 2;
-  if (state.cooldownUntil > now) return 1;
-  return 0;
+  return state.disabledUntil > now ? 2 : 0;
 }
 
-// Черга кандидатів: спершу найдовше не вживані «живі» ключі, потім ті, в кого
-// cooldown уже сплив, і лише в останню чергу — вимкнені. Ключі клієнта
-// (Authorization) мають пріоритет над .env, як і раніше, але ключ у cooldown
-// завжди пропускається на користь робочого.
+// Черга кандидатів: спершу найдовше не вживані робочі ключі (це і дає ротацію
+// «по кругу» від запиту до запиту), вимкнені — в самому кінці. Ключі клієнта
+// (Authorization) мають пріоритет над .env, як і раніше.
 function getKeyCandidates(req, providerName = 'nvidia') {
   const now = Date.now();
   const found = [];
@@ -278,16 +280,17 @@ function markKeyUsed(providerName, value) {
 function markKeySuccess(providerName, value) {
   const state = getKeyState(providerName, value);
   state.failures = 0;
-  state.cooldownUntil = 0;
   state.disabledUntil = 0;
   state.lastUsedAt = Date.now();
 }
 
-// Повертає 'disabled' | 'cooldown' | 'untouched' — щоб роут знав, чи є сенс
+// Повертає 'disabled' | 'rate-limited' | 'untouched' — щоб роут знав, чи є сенс
 // пробувати наступний ключ, чи проблема взагалі не в ключі.
 function markKeyFailure(providerName, value, status, retryAfterMs = 0) {
   const state = getKeyState(providerName, value);
   const now = Date.now();
+  // Для 429 це важливо: ключ стає «щойно використаним», тому наступний запит
+  // обере інший ключ першим (ротація), але жодного бану/cooldown немає.
   state.lastUsedAt = now;
 
   if (status === 401 || status === 403) {
@@ -298,19 +301,16 @@ function markKeyFailure(providerName, value, status, retryAfterMs = 0) {
   }
 
   if (status === 429) {
-    state.failures++;
-    const base = retryAfterMs > 0 ? retryAfterMs : config.keyCooldownMs;
-    const cooldown = state.failures >= KEY_LONG_COOLDOWN_AFTER ? Math.max(base, KEY_LONG_COOLDOWN_MS) : base;
-    state.cooldownUntil = now + cooldown;
-    console.log(`[Keys] ⏳ ${providerName}: ключ ${maskKey(value)} у cooldown ${Math.round(cooldown / 1000)}с (429, підряд ${state.failures})`);
-    return 'cooldown';
+    const after = retryAfterMs > 0 ? `, Retry-After ${Math.round(retryAfterMs / 1000)}с` : '';
+    console.log(`[Keys] ⏳ ${providerName}: ключ ${maskKey(value)} отримав 429${after} — ключ не блокуємо, пробуємо наступний`);
+    return 'rate-limited';
   }
 
   // 5xx / мережа / таймаут — ключ не винен, стан не чіпаємо
   return 'untouched';
 }
 
-// Для тестів і дебагу: стан пула без саміх ключів (тільки маски)
+// Для тестів і дебагу: стан пула без самих ключів (тільки маски)
 function getKeyPoolSnapshot(providerName) {
   const pool = keyPool[providerName];
   if (!pool) return [];
@@ -318,8 +318,8 @@ function getKeyPoolSnapshot(providerName) {
   return [...pool.values()].map(state => ({
     key: maskKey(state.value),
     failures: state.failures,
-    availability: state.disabledUntil > now ? 'disabled' : (state.cooldownUntil > now ? 'cooldown' : 'ok'),
-    cooldownMsLeft: Math.max(0, state.cooldownUntil - now),
+    availability: state.disabledUntil > now ? 'disabled' : 'ok',
+    disabledMsLeft: Math.max(0, state.disabledUntil - now),
   }));
 }
 

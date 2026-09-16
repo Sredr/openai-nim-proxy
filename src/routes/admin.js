@@ -122,6 +122,12 @@ function buildAdminHtml() {
     <div class="row"><div><div class="lbl">Кількість спроб</div></div><input class="num" type="number" id="maxRetries" min="0" max="5"></div>
     <div class="row"><div><div class="lbl">Пауза (мс)</div></div><input class="num" type="number" id="retryDelayMs" min="100" step="100"></div>
   </div>
+  <div class="card">
+    <div class="card-title">♻️ 429 rate limit (круги по ключах)</div>
+    <div class="row"><div><div class="lbl">Кругів</div><div class="desc">Між ключами паузи немає; 1 ключ = 1 спроба за круг</div></div><input class="num" type="number" id="max429Retries" min="1" max="20"></div>
+    <div class="row"><div><div class="lbl">Пауза між кругами (мс)</div></div><input class="num" type="number" id="retry429DelayMs" min="0" step="500"></div>
+    <div class="row"><div><div class="lbl">Макс. очікування всього (мс)</div><div class="desc">Захист клієнта від нескінченного очікування</div></div><input class="num" type="number" id="retry429MaxWaitMs" min="0" step="1000"></div>
+  </div>
   <button class="btn" onclick="save()">💾 Зберегти</button>
   <div id="status"></div>
   
@@ -182,12 +188,16 @@ function buildAdminHtml() {
         const c = await fetch('/admin/config').then(r=>r.json());
         $('enableThinking').checked = c.enableThinking; $('showReasoning').checked = c.showReasoning;
         $('maxRetries').value = c.maxRetries; $('retryDelayMs').value = c.retryDelayMs;
+        $('max429Retries').value = c.max429Retries; $('retry429DelayMs').value = c.retry429DelayMs;
+        $('retry429MaxWaitMs').value = c.retry429MaxWaitMs;
       } catch {}
     }
     async function save() {
       const body = {
         enableThinking: $('enableThinking').checked, showReasoning: $('showReasoning').checked,
         maxRetries: +$('maxRetries').value, retryDelayMs: +$('retryDelayMs').value,
+        max429Retries: +$('max429Retries').value, retry429DelayMs: +$('retry429DelayMs').value,
+        retry429MaxWaitMs: +$('retry429MaxWaitMs').value,
       };
       const headers = {'Content-Type':'application/json'};
       const ki = $('keyInput'); if (ki) headers['x-admin-key'] = ki.value;

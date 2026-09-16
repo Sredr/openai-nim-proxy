@@ -72,24 +72,32 @@ function startServer(env) {
     keyScripts: {
       badkey: [429],            // ключ, який завжди ловить 429
       goodkey: [200],           // ключ, який працює
-      slowkey: ['stream-abort'],// стрім, що обривається посеред відповіді
       'slow-key': ['stream-abort'],
       'stream-key': ['stream-ok'],
-      flaky: [429, 200],        // 429 → ретрай → 200
+      flaky: [429, 200],        // 429 → круг → 200
       broken: [503],            // 5xx назавжди
+      bad1key: [429],           // обидва ключі під 429 — перевірка кругів
+      bad2key: [429],
+      onekey: [429],            // єдиний ключ під 429 — 3 круги = 3 спроби
+      rotA: [200],              // ротація ключів між запитами
+      rotB: [200],
     },
   });
 
   const server = await startServer({
     PORT: TEST_PORT,
     TEST_UPSTREAM_BASE: upstream.baseUrl,
-    NVIDIA_API_KEYS: 'env-nvidia-key-000001',
-    GOOGLE_API_KEYS: 'env-google-key-000001',
+    NVIDIA_API_KEYS: 'env-nvidia-key-000001',   // тільки для тесту невідомого провайдера
+    // Для google env-ключі ЯВНО порожні ('' перекриває значення з реального .env):
+    // інакше ключ із .env став би третім кандидатом і «рятував» запит після 429,
+    // заважаючи точно перевірити круги по ключах
+    GOOGLE_API_KEY: '',
+    GOOGLE_API_KEYS: '',
     MAX_RETRIES: '1',
     RETRY_DELAY_MS: '20',
-    MAX_429_RETRIES: '1',
-    RETRY_429_DELAY_MS: '40',
-    KEY_COOLDOWN_MS: '300',
+    MAX_429_RETRIES: '3',            // 3 круги по ключах
+    RETRY_429_DELAY_MS: '50',        // пауза МІЖ КРУГАМИ (між ключами — 0)
+    RETRY_429_MAX_WAIT_MS: '250',    // сумарний бюджет очікування
     KEY_BAN_MS: '60000',
     MAX_KEY_ATTEMPTS: '3',
     TIMEOUT_MS: '5000',
@@ -166,31 +174,58 @@ function startServer(env) {
       assert(after.failed === before.failed, 'успішний стрім помилково порахований як невдача');
     });
 
-    await runCase('429 на ключі -> перемикання на наступний ключ', async () => {
+    await runCase('429: одразу наступний ключ, без паузи між ключами', async () => {
+      const mark = upstream.calls.length;
       const res = await chat(MODEL, auth(['badkey-000000001', 'goodkey-00000001']));
+      const keysOfRequest = upstream.calls.slice(mark).map(c => c.key);
+
       assert(res.status === 200, `очікували 200 після перемикання ключа, отримали ${res.status}`);
-      assert(upstream.countFor('goodkey') === 1, 'другий ключ не був використаний');
+      assert(keysOfRequest.length === 2, `у першому крузі мало бути рівно 2 виклики, було ${keysOfRequest.length}`);
+      assert(keysOfRequest[0].startsWith('badkey') && keysOfRequest[1].startsWith('goodkey'),
+        `порядок ключів невірний: ${keysOfRequest.join(' -> ')}`);
     });
 
-    await runCase('cooldown: наступний запит одразу йде на робочий ключ', async () => {
+    await runCase('круги: обидва ключі під 429 -> 3 круги x 2 ключі = 6 спроб', async () => {
       const mark = upstream.calls.length;
-      const res = await chat(MODEL, auth(['badkey-000000001', 'goodkey-00000001']));
-      const firstKeyOfRequest = upstream.calls[mark]?.key ?? '';
+      const res = await chat(MODEL, auth(['bad1key-00000001', 'bad2key-00000001']));
+      const calls = upstream.calls.slice(mark);
 
-      assert(res.status === 200, `очікували 200, отримали ${res.status}`);
-      assert(firstKeyOfRequest.startsWith('goodkey'),
-        `очікували, що першим піде goodkey (badkey у cooldown), а пішов "${firstKeyOfRequest}"`);
+      assert(res.status === 429, `очікували 429, отримали ${res.status}`);
+      assert(calls.length === 6, `3 круги × 2 ключі = 6 спроб, було ${calls.length}`);
+      assert(calls[0].key.startsWith('bad1key') && calls[1].key.startsWith('bad2key')
+          && calls[2].key.startsWith('bad1key'),
+        `ключі мають чергуватись по кругу, а було: ${calls.map(c => c.key.slice(0, 6)).join(' ')}`);
     });
 
-    await runCase('ключ повертається в ротацію після cooldown', async () => {
-      await new Promise(r => setTimeout(r, 400));   // KEY_COOLDOWN_MS = 300
+    await runCase('один ключ під 429 -> рівно 3 спроби (3 круги)', async () => {
       const mark = upstream.calls.length;
-      const res = await chat(MODEL, auth(['badkey-000000001', 'goodkey-00000001']));
-      const firstKeyOfRequest = upstream.calls[mark]?.key ?? '';
+      const res = await chat(MODEL, auth(['onekey-0000000001']));
+      const calls = upstream.calls.slice(mark);
 
-      assert(res.status === 200, `очікували 200, отримали ${res.status}`);
-      assert(firstKeyOfRequest.startsWith('badkey'),
-        `після cooldown ключ мав повернутись у чергу, але першим пішов "${firstKeyOfRequest}"`);
+      assert(res.status === 429, `очікували 429, отримали ${res.status}`);
+      assert(calls.length === 3, `1 ключ × 3 круги = 3 спроби, було ${calls.length}`);
+    });
+
+    await runCase('429 не блокує ключ (це ліміт провайдера, а не проблема ключа)', async () => {
+      const mark = upstream.calls.length;
+      const res = await chat(MODEL, auth(['onekey-0000000001']));
+      const firstKey = upstream.calls[mark]?.key ?? '';
+
+      assert(res.status === 429, `очікували 429, отримали ${res.status}`);
+      assert(firstKey.startsWith('onekey'), `ключ після 429 не має блокуватись, а першим пішов "${firstKey}"`);
+    });
+
+    await runCase('ротація між запитами: наступний запит починає з іншого ключа', async () => {
+      const mark1 = upstream.calls.length;
+      await chat(MODEL, auth(['rotA-key-00000001', 'rotB-key-00000001']));
+      const first1 = upstream.calls[mark1]?.key ?? '';
+
+      const mark2 = upstream.calls.length;
+      await chat(MODEL, auth(['rotA-key-00000001', 'rotB-key-00000001']));
+      const first2 = upstream.calls[mark2]?.key ?? '';
+
+      assert(first1.startsWith('rotA'), `перший запит мав почати з rotA, а почав з "${first1}"`);
+      assert(first2.startsWith('rotB'), `другий запит має почати з іншого ключа (rotB), а почав з "${first2}"`);
     });
 
     await runCase('невідомий провайдер: ключ не стає undefined', async () => {
