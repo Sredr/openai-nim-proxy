@@ -23,6 +23,13 @@ const config = {
   streamConnectTimeoutMs:   parseInt(process.env.STREAM_CONNECT_TIMEOUT_MS ?? '120000'),
   // Інтервал keepalive ping для Render (не більше 25с, бо Render вбиває за 30с idle)
   keepaliveIntervalMs:      parseInt(process.env.KEEPALIVE_INTERVAL_MS ?? '20000'),
+  // ── Пул ключів ────────────────────────────────────────────────────────
+  // Скільки різних ключів максимум пробувати в межах одного запиту
+  maxKeyAttempts:           parseInt(process.env.MAX_KEY_ATTEMPTS ?? '3'),
+  // Скільки тримати ключ у cooldown після 429 (якщо провайдер не дав Retry-After)
+  keyCooldownMs:            parseInt(process.env.KEY_COOLDOWN_MS ?? '30000'),
+  // На скільки вимикати ключ після 401/403 (невірний/відкликаний ключ)
+  keyBanMs:                 parseInt(process.env.KEY_BAN_MS ?? '1800000'),
 };
 
 // ── Метрики ──────────────────────────────────────────────────────────────────
@@ -163,9 +170,15 @@ function sendError(res, status, message, providerName) {
   return status;
 }
 
-const PROVIDER_ORDER = ['nvidia', 'google', 'groq', 'openrouter', 'cloudflare', 'github', 'mistral', 'cohere', 'deepseek'];
+// ── Пул ключів зі станом ─────────────────────────────────────────────────────
+// Раніше тут була «сліпа» кругова ротація: ключ змінювався лише наступним
+// запитом, і ніхто не пам'ятав, що ключ щойно віддав 429 або 401. Тепер кожен
+// ключ має стан: cooldown після 429 і тимчасове вимкнення після 401/403.
 
-const keyRotationState = {};
+const KEY_LONG_COOLDOWN_MS = 5 * 60 * 1000;   // якщо ключ ловить 429 підряд
+const KEY_LONG_COOLDOWN_AFTER = 3;
+
+const keyPool = {};   // provider → Map(value → { failures, cooldownUntil, disabledUntil, lastUsedAt })
 
 function getProviderKeys(providerName) {
   // Спробуємо спочатку plural версію (напр. GOOGLE_API_KEYS), потім singular
@@ -174,30 +187,126 @@ function getProviderKeys(providerName) {
   return keysEnv.split(',').map(k => k.trim()).filter(Boolean);
 }
 
-function extractApiKey(req, providerName = 'nvidia') {
-  // 1. Перевіряємо заголовки (для динамічного керування ключами клієнтом)
-  const authHeader = req.headers['authorization'] ?? '';
+function maskKey(value) {
+  if (!value) return 'null';
+  return value.length <= 10 ? value.slice(0, 3) + '…' : value.slice(0, 6) + '…' + value.slice(-3);
+}
+
+function getKeyState(providerName, value) {
+  const pool = keyPool[providerName] ?? (keyPool[providerName] = new Map());
+  let state = pool.get(value);
+  if (!state) {
+    state = { value, failures: 0, cooldownUntil: 0, disabledUntil: 0, lastUsedAt: 0 };
+    pool.set(value, state);
+  }
+  return state;
+}
+
+// 0 — ключ живий, 1 — у cooldown, 2 — вимкнений. Менший ранг = раніше в черзі.
+function keyRank(state, now) {
+  if (state.disabledUntil > now) return 2;
+  if (state.cooldownUntil > now) return 1;
+  return 0;
+}
+
+// Черга кандидатів: спершу найдовше не вживані «живі» ключі, потім ті, в кого
+// cooldown уже сплив, і лише в останню чергу — вимкнені. Ключі клієнта
+// (Authorization) мають пріоритет над .env, як і раніше, але ключ у cooldown
+// завжди пропускається на користь робочого.
+function getKeyCandidates(req, providerName = 'nvidia') {
+  const now = Date.now();
+  const found = [];
+
+  const authHeader = req?.headers?.['authorization'] ?? '';
   const raw = authHeader.startsWith('Bearer ') ? authHeader.slice(7).trim() : null;
   if (raw) {
-    const keys = raw.split(',').map(k => k.trim()).filter(Boolean);
-    if (keys.length > 1) {
-      const idx = PROVIDER_ORDER.indexOf(providerName);
-      return keys[idx % keys.length];
+    for (const value of raw.split(',').map(k => k.trim()).filter(Boolean)) {
+      found.push({ value, source: 'header' });
     }
-    return keys[0];
+  }
+  for (const value of getProviderKeys(providerName)) {
+    found.push({ value, source: 'env' });
   }
 
-  // 2. Використовуємо ротацію ключів з .env
-  const keys = getProviderKeys(providerName);
-  if (keys.length === 0) return null;
-  if (keys.length === 1) return keys[0];
+  const seen = new Set();
+  const unique = [];
+  for (const candidate of found) {
+    if (seen.has(candidate.value)) continue;
+    seen.add(candidate.value);
+    candidate.state = getKeyState(providerName, candidate.value);
+    unique.push(candidate);
+  }
 
-  // Ротація: збільшуємо індекс для кожного провайдера
-  keyRotationState[providerName] = (keyRotationState[providerName] ?? 0);
-  const key = keys[keyRotationState[providerName] % keys.length];
-  keyRotationState[providerName]++;
+  unique.sort((a, b) => {
+    const rankDiff = keyRank(a.state, now) - keyRank(b.state, now);
+    if (rankDiff !== 0) return rankDiff;
+    if (a.source !== b.source) return a.source === 'header' ? -1 : 1;  // ключі клієнта — першими
+    return a.state.lastUsedAt - b.state.lastUsedAt;                     // LRU всередині групи
+  });
 
-  return key;
+  return unique;
+}
+
+function markKeyUsed(providerName, value) {
+  getKeyState(providerName, value).lastUsedAt = Date.now();
+}
+
+function markKeySuccess(providerName, value) {
+  const state = getKeyState(providerName, value);
+  state.failures = 0;
+  state.cooldownUntil = 0;
+  state.disabledUntil = 0;
+  state.lastUsedAt = Date.now();
+}
+
+// Повертає 'disabled' | 'cooldown' | 'untouched' — щоб роут знав, чи є сенс
+// пробувати наступний ключ, чи проблема взагалі не в ключі.
+function markKeyFailure(providerName, value, status, retryAfterMs = 0) {
+  const state = getKeyState(providerName, value);
+  const now = Date.now();
+  state.lastUsedAt = now;
+
+  if (status === 401 || status === 403) {
+    state.failures++;
+    state.disabledUntil = now + config.keyBanMs;
+    console.log(`[Keys] ⛔ ${providerName}: ключ ${maskKey(value)} вимкнено на ${Math.round(config.keyBanMs / 1000)}с (HTTP ${status})`);
+    return 'disabled';
+  }
+
+  if (status === 429) {
+    state.failures++;
+    const base = retryAfterMs > 0 ? retryAfterMs : config.keyCooldownMs;
+    const cooldown = state.failures >= KEY_LONG_COOLDOWN_AFTER ? Math.max(base, KEY_LONG_COOLDOWN_MS) : base;
+    state.cooldownUntil = now + cooldown;
+    console.log(`[Keys] ⏳ ${providerName}: ключ ${maskKey(value)} у cooldown ${Math.round(cooldown / 1000)}с (429, підряд ${state.failures})`);
+    return 'cooldown';
+  }
+
+  // 5xx / мережа / таймаут — ключ не винен, стан не чіпаємо
+  return 'untouched';
+}
+
+// Для тестів і дебагу: стан пула без саміх ключів (тільки маски)
+function getKeyPoolSnapshot(providerName) {
+  const pool = keyPool[providerName];
+  if (!pool) return [];
+  const now = Date.now();
+  return [...pool.values()].map(state => ({
+    key: maskKey(state.value),
+    failures: state.failures,
+    availability: state.disabledUntil > now ? 'disabled' : (state.cooldownUntil > now ? 'cooldown' : 'ok'),
+    cooldownMsLeft: Math.max(0, state.cooldownUntil - now),
+  }));
+}
+
+// Сумісний API: повертає один ключ — перший кандидат із черги.
+// Тут же виправлено баг, коли PROVIDER_ORDER.indexOf() === -1 давав keys[-1]
+// === undefined, і запит ішов узагалі без ключа.
+function extractApiKey(req, providerName = 'nvidia') {
+  const candidates = getKeyCandidates(req, providerName);
+  if (candidates.length === 0) return null;
+  markKeyUsed(providerName, candidates[0].value);
+  return candidates[0].value;
 }
 
 function safeStringify(val) {
@@ -237,5 +346,6 @@ function handleError(err, res, providerName) {
 module.exports = {
   config, stats, trackEndpoint, trackProvider,
   fetchWithRetry, extractApiKey, handleError, errorKindOf, registerOutcome, sendError,
+  getKeyCandidates, markKeyUsed, markKeySuccess, markKeyFailure, getKeyPoolSnapshot,
   httpAgent, httpsAgent,
 };
