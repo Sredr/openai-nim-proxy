@@ -10,5 +10,29 @@
   "groq": {
     "type": "openai",
     "baseUrl": "https://api.groq.com/openai/v1"
+  },
+  "openrouter": {
+    "type": "openai",
+    "baseUrl": "https://openrouter.ai/api/v1"
+  },
+  "cloudflare": {
+    "type": "openai",
+    "baseUrl": "https://api.cloudflare.com/client/v4/accounts/{CLOUDFLARE_ACCOUNT_ID}/ai/v1"
+  },
+  "github": {
+    "type": "openai",
+    "baseUrl": "https://models.github.ai/inference"
+  },
+  "mistral": {
+    "type": "openai",
+    "baseUrl": "https://api.mistral.ai/v1"
+  },
+  "cohere": {
+    "type": "openai",
+    "baseUrl": "https://api.cohere.ai/compatibility/v1"
+  },
+  "deepseek": {
+    "type": "openai",
+    "baseUrl": "https://api.deepseek.com/v1"
   }
 }

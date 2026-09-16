@@ -127,11 +127,16 @@ router.post('/chat/completions', async (req, res) => {
         requestBody.extra_body = { chat_template_kwargs: { thinking: true } };
       }
 
-      let reqUrl = `${provider.baseUrl}/chat/completions`;
+      let baseUrl = provider.baseUrl;
+      if (baseUrl.includes('{CLOUDFLARE_ACCOUNT_ID}')) {
+        baseUrl = baseUrl.replace('{CLOUDFLARE_ACCOUNT_ID}', process.env.CLOUDFLARE_ACCOUNT_ID || '');
+      }
+
+      let reqUrl = `${baseUrl}/chat/completions`;
       const headers = { 'Content-Type': 'application/json' };
 
       if (provider.type === 'gemini') {
-        reqUrl = `${provider.baseUrl}/${pureModelName}:generateContent?key=${apiKey}`;
+        reqUrl = `${baseUrl}/${pureModelName}:generateContent?key=${apiKey}`;
       } else {
         headers['Authorization'] = `Bearer ${apiKey}`;
       }

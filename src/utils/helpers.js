@@ -86,7 +86,7 @@ async function fetchWithRetry(axiosConfig) {
   }
 }
 
-const PROVIDER_ORDER = ['nvidia', 'google', 'groq'];
+const PROVIDER_ORDER = ['nvidia', 'google', 'groq', 'openrouter', 'cloudflare', 'github', 'mistral', 'cohere', 'deepseek'];
 
 const keyRotationState = {};
 
