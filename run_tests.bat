@@ -1,5 +1,4 @@
 @echo off
-start /B node server.js
-timeout /T 3 > nul
+rem Кожен тест сам піднімає і зупиняє власний сервер, тому окремий start не потрібен
 node tests/routes.js
-taskkill /F /IM node.exe > nul 2>&1
+node tests/reliability.js
