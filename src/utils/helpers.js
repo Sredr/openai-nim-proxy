@@ -30,7 +30,7 @@ const config = {
   keepaliveIntervalMs:      parseInt(process.env.KEEPALIVE_INTERVAL_MS ?? '20000'),
   // ── Пул ключів ────────────────────────────────────────────────────────
   // Скільки різних ключів максимум пробувати в межах одного кругу
-  maxKeyAttempts:           parseInt(process.env.MAX_KEY_ATTEMPTS ?? '3'),
+  maxKeyAttempts:           process.env.MAX_KEY_ATTEMPTS ? parseInt(process.env.MAX_KEY_ATTEMPTS) : undefined,
   // На скільки вимикати ключ після 401/403 (невірний/відкликаний ключ).
   // УВАГА: 429 сюди не входить — це ліміт провайдера, а не проблема ключа.
   keyBanMs:                 parseInt(process.env.KEY_BAN_MS ?? '1800000'),
