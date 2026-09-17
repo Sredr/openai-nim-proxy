@@ -135,7 +135,8 @@ router.post('/chat/completions', async (req, res) => {
       // ── Ключі: черга кандидатів замість одного ключа ─────────────────────
       // Ключі в cooldown/бані переміщуються в кінець черги, тому проблемний
       // ключ більше не «зʼїдає» запит — пробуємо наступний.
-      const candidates = getKeyCandidates(req, providerName).slice(0, Math.max(1, config.maxKeyAttempts));
+      const maxKeys = config.maxKeyAttempts !== undefined ? Math.max(1, config.maxKeyAttempts) : Infinity;
+      const candidates = getKeyCandidates(req, providerName).slice(0, maxKeys);
 
       if (candidates.length === 0) { 
         console.warn(`[Router] ⚠️ Ключ відсутній для ${providerName}. Повертаю 401.`); 
