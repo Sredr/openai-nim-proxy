@@ -1,7 +1,12 @@
 const express = require('express');
 const router = express.Router();
 const providersConfig = require('../../config/providers.json');
-const routerConfig = require('../../config/router.json');
+let routerConfig = { aliases: {} };
+try {
+  routerConfig = require('../../config/router.json');
+} catch {
+  // router.json is optional — if missing, no aliases, only exact model names work
+}
 const adapters = require('../adapters');
 const { getKeyCandidates, markKeySuccess, markKeyFailure, fetchWithRetry, handleError, trackEndpoint, trackProvider, registerOutcome, sendError, stats, config, httpAgent, httpsAgent } = require('../utils/helpers');
 
@@ -58,8 +63,17 @@ function startKeepalive(res, intervalMs = 20000) {
 router.post('/chat/completions', async (req, res) => {
   stats.total++; trackEndpoint('POST /v1/chat/completions');
   
-  const requestedAlias = req.body.model || 'default';
-  const modelChain = resolveModelChain(requestedAlias);
+  // ── Multi-model support: "model1,model2" OR ["model1","model2"] OR single ──
+  let requestedModels = req.body.model || 'default';
+  if (Array.isArray(requestedModels)) {
+    // already array
+  } else if (typeof requestedModels === 'string') {
+    requestedModels = requestedModels.split(',').map(m => m.trim()).filter(Boolean);
+  } else {
+    requestedModels = ['default'];
+  }
+  // Build full chain: each requested model expands through aliases
+  const modelChain = requestedModels.flatMap(m => resolveModelChain(m));
 
   if (req.body.messages) {
     let sanitizedMessages = [];

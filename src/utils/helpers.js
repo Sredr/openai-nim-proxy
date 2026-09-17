@@ -210,10 +210,21 @@ function sendError(res, status, message, providerName) {
 const keyPool = {};   // provider → Map(value → { failures, disabledUntil, lastUsedAt })
 
 function getProviderKeys(providerName) {
-  // Спробуємо спочатку plural версію (напр. GOOGLE_API_KEYS), потім singular
-  const keysEnv = process.env[`${providerName.toUpperCase()}_API_KEYS`] || process.env[`${providerName.toUpperCase()}_API_KEY`];
-  if (!keysEnv) return [];
-  return keysEnv.split(',').map(k => k.trim()).filter(Boolean);
+  const P = providerName.toUpperCase();
+  const keys = [];
+  // 1) Plural-версія зі списком через кому (напр. NVIDIA_API_KEYS=nvapi-a,nvapi-b)
+  const list = process.env[`${P}_API_KEYS`];
+  if (list) keys.push(...list.split(',').map(k => k.trim()).filter(Boolean));
+  // 2) Singular (NVIDIA_API_KEY)
+  const single = process.env[`${P}_API_KEY`];
+  if (single) keys.push(...single.split(',').map(k => k.trim()).filter(Boolean));
+  // 3) Нумеровані (NVIDIA_API_KEY_1, _KEY_2, …) — зручні для rot-ключів у .env
+  for (let i = 1; i <= 20; i++) {
+    const numbered = process.env[`${P}_API_KEY_${i}`];
+    if (!numbered) continue;
+    keys.push(...numbered.split(',').map(k => k.trim()).filter(Boolean));
+  }
+  return keys;
 }
 
 function maskKey(value) {
