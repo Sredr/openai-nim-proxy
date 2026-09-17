@@ -317,7 +317,14 @@ function markKeyFailure(providerName, value, status, retryAfterMs = 0) {
     return 'rate-limited';
   }
 
-  // 5xx / мережа / таймаут — ключ не винен, стан не чіпаємо
+  // 5xx (500, 502, 503...) — transient, той самий ключ може спрацювати на спробі з іншим запитом.
+  // Повертаємо 'rate-limited' щоб роут крутив ключі в колі (rounds).
+  if (status != null && status >= 500) {
+    console.log(`[Keys] 🔁 ${providerName}: ключ ${maskKey(value)} отримав ${status} — transient, пробуємо наступний ключ`);
+    return 'rate-limited';
+  }
+
+  // 4xx (крім 429), мережа, таймаут — ключ не винен, стан не чіпаємо
   return 'untouched';
 }
 

@@ -143,10 +143,11 @@ function startServer(env) {
       const after = await getStats();
 
       assert(res.status === 503, `очікували 503, отримали ${res.status}`);
-      assert(upstream.countFor('broken') === 2, `мало бути 2 спроби (1 + ретрай), було ${upstream.countFor('broken')}`);
-      // err5xx рахує КОЖНУ помилку від upstream: 2 спроби → +2
-      assert(after.err5xx === before.err5xx + 2,
-        `err5xx мав зрости на 2 (дві спроби), було ${before.err5xx}, стало ${after.err5xx}`);
+      // 5xx теж йде через key rounds: 3 rounds x 1 key = 3 спроби
+      assert(upstream.countFor('broken') === 3, `мало бути 3 спроби (3 rounds x 1 key), було ${upstream.countFor('broken')}`);
+      // err5xx рахує КОЖНУ помилку від upstream: 3 спроби → +3
+      assert(after.err5xx === before.err5xx + 3,
+        `err5xx мав зрости на 3 (три спроби), було ${before.err5xx}, стало ${after.err5xx}`);
       assert(after.failed === before.failed + 1, 'failed мав зрости на 1');
     });
 

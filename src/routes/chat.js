@@ -234,8 +234,8 @@ router.post('/chat/completions', async (req, res) => {
           attemptsThisRound++;
 
           try {
-            // max429Retries: 0 — 429 не ретраїмо всередині fetchWithRetry, щоб
-            // одразу перемкнутись на наступний ключ (крутить саме цей цикл)
+            // max429Retries: 0 — 429 не ретраїмо всередині fetchWithRetry
+            // maxRetries: 0 — 5xx теж не ретраїмо тут, chat.js крутить rounds по ключах
             response = await fetchWithRetry({
               method: 'post',
               url: reqUrl,
@@ -246,7 +246,7 @@ router.post('/chat/completions', async (req, res) => {
               httpAgent,
               httpsAgent,
               signal: abortController.signal,
-            }, { providerName, max429Retries: 0 });
+            }, { providerName, max429Retries: 0, maxRetries: 0 });
 
             if (attemptsMade > 1) stats.retriedOk++;
             markKeySuccess(providerName, apiKey);
