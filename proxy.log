@@ -1,0 +1,47 @@
+
+╔══════════════════════════════════════════════════╗
+║         🔑 ADMIN KEY (згенеровано авто)          ║
+║  268b2d35-5d75-4aee-83cc-85e7337aa2df  ║
+╚══════════════════════════════════════════════════╝
+
+✅ Universal Proxy запущено на порту 3000
+   streamConnectTimeoutMs = 120000
+   keepaliveIntervalMs    = 20000
+   timeoutMs              = 85000
+[Router] ➡️ Направляю на: nvidia | Модель: nemotron-3-super-120b-a12b | stream=false | ключів у черзі: 2
+[Router] ❌ Помилка на nvidia/nemotron-3-super-120b-a12b: HTTP 404  
+[Router] ➡️ Направляю на: nvidia | Модель: mistralai/mistral-nemotron | stream=false | ключів у черзі: 2
+[Router] ✅ Відповідь від: mistralai/mistral-nemotron | TTFB: 12340ms
+[Router] ➡️ Направляю на: nvidia | Модель: nemotron-3-super-120b-a12b | stream=false | ключів у черзі: 2
+[Router] ❌ Помилка на nvidia/nemotron-3-super-120b-a12b: HTTP 404  
+[Router] ➡️ Направляю на: nvidia | Модель: nemotron-3-ultra-550b-a55b | stream=false | ключів у черзі: 2
+[Router] ❌ Помилка на nvidia/nemotron-3-ultra-550b-a55b: HTTP 404  
+[Router] ➡️ Направляю на: nvidia | Модель: mistralai/mistral-nemotron | stream=false | ключів у черзі: 2
+[Keys] ⛔ nvidia: ключ nvapi-…0A8 вимкнено на 1800с (HTTP 403)
+[Router] 🔑 nvidia: ключ відхилено (HTTP 403) → disabled, беру наступний ключ
+[Router] ✅ Відповідь від: mistralai/mistral-nemotron | TTFB: 2953ms
+[Router] ➡️ Направляю на: nvidia | Модель: nemotron-3-super-120b-a12b | stream=false | ключів у черзі: 2
+[Router] ❌ Помилка на nvidia/nemotron-3-super-120b-a12b: HTTP 404  
+[Router] ➡️ Направляю на: nvidia | Модель: nemotron-3-ultra-550b-a55b | stream=false | ключів у черзі: 2
+[Router] ❌ Помилка на nvidia/nemotron-3-ultra-550b-a55b: HTTP 404  
+[Router] ➡️ Направляю на: nvidia | Модель: mistralai/mistral-nemotron | stream=false | ключів у черзі: 2
+[Router] ✅ Відповідь від: mistralai/mistral-nemotron | TTFB: 1748ms
+[Router] ➡️ Направляю на: nvidia | Модель: nemotron-3-super-120b-a12b | stream=false | ключів у черзі: 2
+[Router] ❌ Помилка на nvidia/nemotron-3-super-120b-a12b: HTTP 404  
+[404 Client Error | 4xx] "404 page not found\n"
+[Router] ➡️ Направляю на: google | Модель: gemini-3.5-flash-lite | stream=false | ключів у черзі: 1
+[Router] ✅ Відповідь від: google/gemini-3.5-flash-lite | TTFB: 7253ms
+[Router] ➡️ Направляю на: nvidia | Модель: nemotron-3-super-120b-a12b | stream=false | ключів у черзі: 2
+[Router] ❌ Помилка на nvidia/nemotron-3-super-120b-a12b: HTTP 404  
+[Router] ➡️ Направляю на: google | Модель: gemini-3.5-flash-lite | stream=false | ключів у черзі: 1
+[Router] ✅ Відповідь від: google/gemini-3.5-flash-lite | TTFB: 493ms
+[Router] ➡️ Направляю на: nvidia | Модель: nemotron-3-super-120b-a12b | stream=false | ключів у черзі: 2
+[Router] ❌ Помилка на nvidia/nemotron-3-super-120b-a12b: HTTP 404  
+[Router] ➡️ Направляю на: nvidia | Модель: nemotron-3-ultra-550b-a55b | stream=false | ключів у черзі: 2
+[Router] ❌ Помилка на nvidia/nemotron-3-ultra-550b-a55b: HTTP 404  
+[Router] ➡️ Направляю на: nvidia | Модель: mistralai/mistral-nemotron | stream=false | ключів у черзі: 2
+[Router] ✅ Відповідь від: mistralai/mistral-nemotron | TTFB: 35805ms
+[Router] ➡️ Направляю на: nvidia | Модель: nemotron-3-super-120b-a12b | stream=false | ключів у черзі: 2
+[Router] ❌ Помилка на nvidia/nemotron-3-super-120b-a12b: HTTP 404  
+[Router] ➡️ Направляю на: google | Модель: gemini-3.5-flash-lite | stream=false | ключів у черзі: 1
+[Router] ✅ Відповідь від: google/gemini-3.5-flash-lite | TTFB: 687ms

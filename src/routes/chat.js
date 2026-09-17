@@ -180,28 +180,45 @@ router.post('/chat/completions', async (req, res) => {
       let lastRetryAfterMs = 0;
       let attemptsMade = 0;
 
-      // ── Круги по ключах при 429 ──────────────────────────────────────────
-      // 429 — це ліміт провайдера/моделі, а не провина ключа (буває «спільний»
-      // ліміт, який зникає будь-якої секунди). Тому:
+      // ── Круги по ключах при 429/5xx ──────────────────────────────────────────
+      // 429/5xx — це ліміт провайдера/моделі, а не провина ключа.
+      // Тому:
       //   • між ключами паузи НЕМАЄ — одразу йдемо на наступний ключ;
       //   • пауза config.retry429DelayMs (3с) робиться МІЖ КРУГАМИ;
-      //   • ключ після 429 не блокується (лише позначається як щойно вживаний,
-      //     тому наступний запит почне з іншого ключа);
+      //   • ключ після 429/5xx не блокується (лише позначається як щойно вживаний);
       //   • 401/403 — реальна проблема ключа: ключ вимикається, беремо наступний;
       //   • крутимо, доки не отримаємо відповідь, не вичерпаємо круги
       //     (адмінка: «Кількість кругів при 429») або поки клієнт не відключився.
       const rounds = Math.max(1, config.max429Retries || 1);
-      const retryDeadline = Date.now() + Math.max(config.retry429DelayMs, config.retry429MaxWaitMs);
+      
+      // Дедлайн ТІЛЬКИ для 429 (де є Retry-After від провайдера).
+      // Для 5xx/429 без Retry-After — робимо всі rounds повністю.
+      let retryDeadline = 0;
+      let hasRetryAfter = false;
 
       for (let round = 0; round < rounds && !response; round++) {
         if (round > 0) {
-          // Пауза перед новим кругом. Retry-After провайдера поважаємо, але
-          // сумарно не даємо клієнту чекати більше retry429MaxWaitMs.
-          const waitMs = Math.max(config.retry429DelayMs, Math.min(lastRetryAfterMs, config.retry429MaxWaitMs));
-          if (Date.now() + waitMs > retryDeadline) {
+          // Пауза перед новим кругом.
+          // Для 429: поважаємо Retry-After, але не більше retry429MaxWaitMs.
+          // Для 5xx: просто retry429DelayMs (3с), дедлайну немає.
+          const is429 = lastRetryAfterMs > 0;
+          const waitMs = is429
+            ? Math.max(config.retry429DelayMs, Math.min(lastRetryAfterMs, config.retry429MaxWaitMs))
+            : config.retry429DelayMs;
+
+          // Дедлайн ТІЛЬКИ для 429 (де є Retry-After від провайдера).
+          // Якщо це перший 429 з Retry-After — ставимо дедлайн.
+          if (is429 && !hasRetryAfter && lastRetryAfterMs > 0) {
+            retryDeadline = Date.now() + Math.max(config.retry429DelayMs, config.retry429MaxWaitMs);
+            hasRetryAfter = true;
+          }
+
+          // Перевірка дедлайну ТІЛЬКИ для 429 з Retry-After.
+          if (hasRetryAfter && Date.now() + waitMs > retryDeadline) {
             console.log(`[Router] ⏱ Бюджет очікування на 429 вичерпано — припиняю круги на ${pureModelName}`);
             break;
           }
+
           console.log(`[Router] ⏳ Круг ${round + 1}/${rounds} (ключів: ${candidates.length}) — пауза ${waitMs}ms`);
           await new Promise(r => setTimeout(r, waitMs));
           if (abortController.signal.aborted) break;
