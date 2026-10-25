@@ -231,11 +231,19 @@ router.post('/chat/completions', async (req, res) => {
           if (abortController.signal.aborted) break;
           const apiKey = candidate.value;
 
-          if (typeof apiKey === 'string' && (apiKey === 'nvapi-' || apiKey.endsWith('-') || apiKey.trim().length < 10)) {
-            console.warn(`[Router] ⚠️ Ключ для ${providerName} виглядає невалідним — пробую наступний`);
-            markKeyFailure(providerName, apiKey, 401);
-            keyError = Object.assign(new Error(`Невірний API ключ для ${providerName}`), { response: { status: 401 } });
-            continue;
+          // Валідація ключа: для nvidia перевіряємо формат, для інших — лише очевидний бред
+          if (typeof apiKey === 'string') {
+            const trimmed = apiKey.trim();
+            const isNvidia = providerName === 'nvidia';
+            const isInvalid = isNvidia
+              ? (trimmed === 'nvapi-' || trimmed.endsWith('-') || trimmed.length < 10)
+              : (trimmed === '' || trimmed.length < 5); // для інших провайдерів — лише порожній або надто короткий
+            if (isInvalid) {
+              console.warn(`[Router] ⚠️ Ключ для ${providerName} виглядає невалідним — пробую наступний`);
+              markKeyFailure(providerName, apiKey, 401);
+              keyError = Object.assign(new Error(`Невірний API ключ для ${providerName}`), { response: { status: 401 } });
+              continue;
+            }
           }
 
           let reqUrl = `${baseUrl}/chat/completions`;
