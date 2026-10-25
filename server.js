@@ -8,6 +8,13 @@ const mediaRoutes = require('./src/routes/media');
 const adminRoutes = require('./src/routes/admin');
 
 const app = express();
+
+// Нормалізація подвійних або зайвих слешів у URL
+app.use((req, res, next) => {
+  req.url = req.url.replace(/\/{2,}/g, '/');
+  next();
+});
+
 const PORT = process.env.PORT || 3000;
 const NIM_API_BASE = 'https://integrate.api.nvidia.com/v1';
 
@@ -31,6 +38,12 @@ app.get('/health', (req, res) => res.json({
     maxRetries: config.maxRetries,
   }
 }));
+
+// Заглушка списку моделей (OpenAI-сумісний формат).
+// Не вигадуємо моделі — повертаємо порожній список, щоб клієнти
+// (Roo Code, Cline, Continue) отримали валідний JSON замість 404 від NVIDIA.
+app.get('/models', (req, res) => res.json({ object: 'list', data: [] }));
+app.get('/v1/models', (req, res) => res.json({ object: 'list', data: [] }));
 
 // Pass-through для всіх інших /v1/* ендпоінтів (embeddings, completions, models)
 app.all('/v1/*', async (req, res) => {

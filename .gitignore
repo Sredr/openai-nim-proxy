@@ -1,3 +1,4 @@
 node_modules/
 .env
 .ai_notes.md
+proxy.log
