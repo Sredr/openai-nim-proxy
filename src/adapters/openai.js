@@ -35,6 +35,11 @@ function cleanResponse(data, config) {
       delete choice.message.vertex_ai_safety_results;
       delete choice.message.vertex_ai_citation_metadata;
 
+      // Якщо повідомлення містить тільки tool_calls або content відсутній
+      if (choice.message.content == null) {
+        continue;
+      }
+
       const { thought, content } = extractThoughtTags(choice.message.content || '');
 
       if (config?.showReasoning) {
@@ -77,20 +82,40 @@ function processSseLine(jsonStr, res, config) {
   let content = String(delta.content || '');
   if (res.isThinking === undefined) res.isThinking = false;
 
+  // Якщо контент порожній (наприклад, delta.content === ""), але є tool_calls чи finish_reason
+  if (content.length === 0) {
+    res.write(`data: ${JSON.stringify(parsed)}\n\n`);
+    return;
+  }
+
+  // Допоміжна функція: зберігає всі поля вихідного чанка (id, model, finish_reason, tool_calls тощо)
+  const sendModifiedChunk = (deltaUpdates) => {
+    const chunk = { ...parsed };
+    if (Array.isArray(parsed.choices)) {
+      chunk.choices = parsed.choices.map((ch, idx) => {
+        if (idx === 0) {
+          const choiceCopy = { ...ch };
+          choiceCopy.delta = { ...(ch.delta || {}), ...deltaUpdates };
+          return choiceCopy;
+        }
+        return ch;
+      });
+    } else {
+      chunk.choices = [{ index: 0, delta: deltaUpdates }];
+    }
+    res.write(`data: ${JSON.stringify(chunk)}\n\n`);
+  };
+
   while (content.length > 0) {
     if (!res.isThinking) {
       const startIdx = content.indexOf('<thought>');
       if (startIdx === -1) {
-        res.write(`data: ${JSON.stringify({
-          choices: [{ delta: { content, role: 'assistant' }, index: 0 }]
-        })}\n\n`);
+        sendModifiedChunk({ content });
         content = '';
       } else {
         const before = content.slice(0, startIdx);
         if (before) {
-          res.write(`data: ${JSON.stringify({
-            choices: [{ delta: { content: before, role: 'assistant' }, index: 0 }]
-          })}\n\n`);
+          sendModifiedChunk({ content: before });
         }
         content = content.slice(startIdx + '<thought>'.length);
         res.isThinking = true;
@@ -99,17 +124,13 @@ function processSseLine(jsonStr, res, config) {
       const endIdx = content.indexOf('</thought>');
       if (endIdx === -1) {
         if (config.showReasoning) {
-          res.write(`data: ${JSON.stringify({
-            choices: [{ delta: { reasoning_content: content, role: 'assistant' }, index: 0 }]
-          })}\n\n`);
+          sendModifiedChunk({ reasoning_content: content, content: undefined });
         }
         content = '';
       } else {
         const thought = content.slice(0, endIdx);
         if (config.showReasoning && thought) {
-          res.write(`data: ${JSON.stringify({
-            choices: [{ delta: { reasoning_content: thought, role: 'assistant' }, index: 0 }]
-          })}\n\n`);
+          sendModifiedChunk({ reasoning_content: thought, content: undefined });
         }
         content = content.slice(endIdx + '</thought>'.length);
         res.isThinking = false;
@@ -119,7 +140,13 @@ function processSseLine(jsonStr, res, config) {
 }
 
 module.exports = {
-  formatReq: (body, model) => ({ ...body, model }),
+  formatReq: (body, model) => {
+    const formatted = { ...body, model };
+    if (formatted.max_completion_tokens !== undefined && formatted.max_tokens === undefined) {
+      formatted.max_tokens = formatted.max_completion_tokens;
+    }
+    return formatted;
+  },
   formatRes: (data, config) => cleanResponse(data, config),
 
   parseStream: (chunk, res, config) => {

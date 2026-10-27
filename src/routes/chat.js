@@ -24,6 +24,61 @@ function resolveModelChain(modelName, visited = new Set()) {
   return [modelName];
 }
 
+function mergeContent(c1, c2) {
+  if (c1 == null) return c2;
+  if (c2 == null) return c1;
+  if (typeof c1 === 'string' && typeof c2 === 'string') {
+    return c1 ? (c2 ? c1 + '\n\n' + c2 : c1) : c2;
+  }
+  const toParts = c => {
+    if (Array.isArray(c)) return c;
+    if (typeof c === 'string') return [{ type: 'text', text: c }];
+    if (typeof c === 'object') return [c];
+    return [{ type: 'text', text: String(c) }];
+  };
+  return [...toParts(c1), ...toParts(c2)];
+}
+
+function sanitizeMessages(messages) {
+  if (!Array.isArray(messages)) return messages;
+  const sanitized = [];
+  let systemMsg = null;
+
+  for (const rawMsg of messages) {
+    if (!rawMsg || typeof rawMsg !== 'object') continue;
+    const msg = { ...rawMsg };
+
+    if (msg.role === 'system') {
+      if (!systemMsg) {
+        systemMsg = msg;
+      } else {
+        systemMsg.content = mergeContent(systemMsg.content, msg.content);
+      }
+    } else {
+      const last = sanitized[sanitized.length - 1];
+      // Об'єднуємо ТІЛЬКИ звичайні повідомлення:
+      // не чіпаємо 'tool' (мають унікальний tool_call_id) та повідомлення з tool_calls
+      const canMerge = last &&
+        last.role === msg.role &&
+        msg.role !== 'tool' &&
+        !last.tool_calls &&
+        !msg.tool_calls;
+
+      if (canMerge) {
+        last.content = mergeContent(last.content, msg.content);
+      } else {
+        sanitized.push(msg);
+      }
+    }
+  }
+
+  if (systemMsg) {
+    sanitized.unshift(systemMsg);
+  }
+
+  return sanitized;
+}
+
 // SSE-заголовки для стрімінгу через nginx (Render, Railway, Heroku тощо).
 // X-Accel-Buffering: no — вимикає буферизацію nginx, без нього nginx
 // накопичує весь стрім і відправляє одним шматком тільки після закриття з'єднання.
@@ -76,19 +131,7 @@ router.post('/chat/completions', async (req, res) => {
   const modelChain = requestedModels.flatMap(m => resolveModelChain(m));
 
   if (req.body.messages) {
-    let sanitizedMessages = [];
-    let systemContent = '';
-    for (const msg of req.body.messages) {
-      const cleanMsg = { role: msg.role, content: msg.content ?? '' };
-      if (cleanMsg.role === 'system') systemContent += (systemContent ? '\n\n' : '') + cleanMsg.content;
-      else {
-        const last = sanitizedMessages[sanitizedMessages.length - 1];
-        if (last && last.role === cleanMsg.role) last.content += '\n\n' + cleanMsg.content;
-        else sanitizedMessages.push(cleanMsg);
-      }
-    }
-    if (systemContent) sanitizedMessages.unshift({ role: 'system', content: systemContent });
-    req.body.messages = sanitizedMessages;
+    req.body.messages = sanitizeMessages(req.body.messages);
   }
 
   const isStream = req.body.stream === true;
@@ -429,5 +472,7 @@ router.post('/chat/completions', async (req, res) => {
 
   handleError(lastError || new Error("Всі моделі в ланцюжку недоступні"), res, lastProviderName);
 });
+
+router.sanitizeMessages = sanitizeMessages;
 
 module.exports = router;
