@@ -34,5 +34,9 @@
   "deepseek": {
     "type": "openai",
     "baseUrl": "https://api.deepseek.com/v1"
+  },
+  "openai": {
+    "type": "openai",
+    "baseUrl": "https://api.openai.com/v1"
   }
 }
